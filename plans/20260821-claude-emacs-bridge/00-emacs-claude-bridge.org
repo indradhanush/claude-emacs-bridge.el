@@ -1,0 +1,124 @@
+:PROPERTIES:
+:STATUS: IMPLEMENTED
+:STATUS_UPDATED_ON: 2026-08-21 15:13
+:END:
+#+ARCHIVE: %s_archive::
+#+title: Claude Emacs Bridge
+#+date: 2026-08-21
+
+* Objective
+
+Build an Emacs command that uses the active region or current line to identify
+an inclusive line range, then sends that range, the absolute file path, and a
+minibuffer instruction to a dedicated Claude Code coordinator. The coordinator
+forwards the message to a selected local Claude Code session through native
+cross-session messaging. The selected text itself is not sent.
+
+* Acceptance Criteria
+
+- [X] An interactive command rejects buffers without a visited file.
+- [X] Without an active region, the command sends the current line number.
+- [X] The target payload contains the absolute file path, inclusive start and
+  end line numbers, instruction, and ACK-only completion requirement.
+- [X] A region ending at the beginning of a line reports the preceding selected
+  line as its inclusive end line.
+- [X] A command starts or reuses a dedicated =*claude-emacs-server*= vterm
+  running the Claude Code session named =emacs-server=.
+- [X] The coordinator process starts without =DO_NOT_TRACK= so cross-session
+  messaging can be enabled without changing Emacs's global environment.
+- [X] Every introduced helper has a direct ERT test.
+- [X] Tests pass in the running Doom Emacs instance.
+- [X] A live proof sends the expected path, lines, and instruction to =task-1=
+  without sending the selected text.
+
+* Verified Facts
+
+- Claude Code 2.1.238 exposes =/list-agents= after =DO_NOT_TRACK=true= is
+  removed from the process environment.
+- =emacs-server= can send a native cross-session message to =task-1=, and
+  =task-1= can reply to =emacs-server=.
+- Doom's vterm module is enabled in =init.el=.
+- Package changes require ERT coverage under =tests/= and verification in
+  isolated and running Doom Emacs.
+
+* Tasks
+
+** DONE Implement the session bridge
+
+- Add =claude-emacs-bridge.el=.
+- Add a coordinator start-or-reuse command.
+- Add a send command and prompt formatter.
+- Load the feature from =config.el=.
+
+** DONE Add tests
+
+- Add =tests/claude-emacs-bridge-tests.el=.
+- Cover every helper and each rejected input.
+
+** DONE Verify the proof of concept
+
+- Run the ERT tests through =emacsclient=.
+- Start or reuse the coordinator vterm.
+- Confirm =task-1= receives the expected message.
+
+** DONE Add the current-line fallback
+
+- Treat point without an active region as a single-line range.
+- Preserve inclusive range behavior when a region is active.
+- Use the concise =claude-emacs-bridge-send= command name; the feature
+  namespace already identifies its purpose.
+- Add regression coverage and repeat live verification.
+
+* Verification
+
+- Isolated Emacs: 13 ERT tests passed with no unexpected results.
+- Running Doom Emacs: 13 ERT tests passed with no unexpected results.
+- Live message: the bridge sent
+  =/Users/dhanush/.config/doom/claude-emacs-bridge.el= lines =1-2= with an
+  instruction that prohibited file changes; =task-1= replied
+  =bridge-poc-received= to =emacs-server=.
+- Live current-line fallback: with no active region and point on line =5=, the
+  =claude-emacs-bridge-send= command sent lines =5-5=; =task-1= replied
+  =current-line-poc-received=.
+- Static checks: =check-parens= and =checkdoc-current-buffer= completed without
+  errors. New files contain no trailing whitespace and end with newlines.
+
+* Decisions
+
+- [2026-08-21] Use Claude Code native cross-session messaging through a dumb
+  coordinator because it avoids API, MCP, channel, and private socket
+  integrations.
+- [2026-08-21] Use a dedicated Emacs vterm because Emacs can send input directly
+  to a process it owns.
+- [2026-08-21] Keep the proof of concept available through =M-x= commands only;
+  defer keybindings and response presentation.
+- [2026-08-21] Unset =DO_NOT_TRACK= only for the coordinator process rather than
+  changing the global Emacs environment.
+
+* Constraints
+
+- Claude Code may paraphrase the forwarding prompt even when asked to preserve
+  it. The path, line range, and instruction remain explicit.
+- The receiving session retains its own permission checks.
+
+* Rejected Approaches
+
+- Claude API: explicitly unavailable for this work.
+- Custom MCP or channel plugin: unnecessary for the local proof of concept.
+- Direct inbox-socket client: depends on lower-level authentication and framing.
+- Terminal keystroke injection into an external terminal: more fragile than an
+  Emacs-owned vterm process.
+
+* Follow-up Plans
+
+- [[file:./01-project-session-routing.org][Project Session Routing]]: replace
+  the hardcoded target with active-session discovery and transient per-project
+  associations.
+
+* Next Steps
+
+- [X] Review this plan with Dhanush.
+- [X] Implement and verify the approved proof of concept.
+- [X] Add and verify the current-line fallback.
+- Context: the proof of concept is complete. An active region sends its inclusive
+  line range; otherwise =claude-emacs-bridge-send= sends the line at point.
