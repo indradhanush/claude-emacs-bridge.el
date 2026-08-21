@@ -277,9 +277,31 @@
             (setq-local claude-emacs-bridge--coordinator-p t))
           (cl-letf (((symbol-function 'derived-mode-p) (lambda (&rest _) t))
                     ((symbol-function 'vterm-check-proc)
-                     (lambda (&optional _) t)))
+                     (lambda (&optional _) t))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (&rest _)
+                       (ert-fail "A live coordinator must not prompt")))
+                    ((symbol-function 'claude-emacs-bridge-start)
+                     (lambda ()
+                       (ert-fail "A live coordinator must not restart"))))
             (should (eq (claude-emacs-bridge--coordinator-buffer) buffer))))
       (kill-buffer buffer))))
+
+(ert-deftest claude-emacs-bridge--log-status-test/appends-status ()
+  "The log records coordinator status messages."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*claude-emacs-bridge-status-log-test*")))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-status
+           "Claude coordinator is not running.")
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should
+             (equal (buffer-string)
+                    "Status: Claude coordinator is not running.\n\n"))
+            (should buffer-read-only)))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
 
 (ert-deftest claude-emacs-bridge--log-message-test/appends-message-details ()
   "The log records the target, file, line range, and message."
@@ -294,7 +316,7 @@
              (equal (buffer-string)
                     (concat "Target: task-1\n"
                             "File: /tmp/example.go\n"
-                            "Lines: 4-7\n"
+                            "Lines: 4:7\n"
                             "Message: Review these lines.\n\n")))
             (should buffer-read-only)))
       (when (get-buffer claude-emacs-bridge-log-buffer-name)
@@ -387,6 +409,18 @@
           (should (= return-count 1)))
       (kill-buffer coordinator))))
 
+(ert-deftest claude-emacs-bridge-clear-test/decline-does-not-send ()
+  "Clearing stops without terminal input when coordinator startup is declined."
+  (cl-letf (((symbol-function 'claude-emacs-bridge--coordinator-buffer)
+             (lambda () nil))
+            ((symbol-function 'vterm-send-string)
+             (lambda (&rest _) (ert-fail "A declined clear must not send")))
+            ((symbol-function 'vterm-send-return)
+             (lambda () (ert-fail "A declined clear must not submit")))
+            ((symbol-function 'message)
+             (lambda (&rest _) (ert-fail "A declined clear must not report a send"))))
+    (should-not (claude-emacs-bridge-clear))))
+
 (ert-deftest claude-emacs-bridge-send-test/sends-path-lines-and-instruction ()
   "Sending a region pastes only its file location and instruction, then submits."
   (let* ((claude-emacs-bridge-buffer-name
@@ -448,27 +482,99 @@
              (equal (buffer-string)
                     (concat "Target: task-1\n"
                             "File: /tmp/example.go\n"
-                            "Lines: 1-2\n"
+                            "Lines: 1:2\n"
                             "Message: Review these lines.\n\n"))))
           (should
            (equal reported-message
-                  (concat "Sent to task-1: /tmp/example.go lines 1-2; "
-                          "logged in " claude-emacs-bridge-log-buffer-name))))
+                  "Sent to task-1: /tmp/example.go lines 1-2")))
       (when (get-buffer claude-emacs-bridge-log-buffer-name)
         (kill-buffer claude-emacs-bridge-log-buffer-name))
       (kill-buffer coordinator))))
 
-(ert-deftest claude-emacs-bridge-send-test/rejects-missing-coordinator ()
-  "Sending fails clearly when the dedicated coordinator is not running."
+(ert-deftest claude-emacs-bridge-send-test/starts-missing-coordinator-and-sends ()
+  "Accepting the prompt starts the coordinator and continues the original send."
+  (let* ((claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-missing-test*"))
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-missing-log-test*"))
+         (coordinator (generate-new-buffer " *claude-emacs-bridge-started-test*"))
+         (prompt-count 0)
+         (start-count 0)
+         (resolve-count 0)
+         (source-buffer nil)
+         (sent-string nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'y-or-n-p)
+                   (lambda (prompt)
+                     (should
+                      (equal prompt
+                             "Claude coordinator is not running; start it now? "))
+                     (setq prompt-count (1+ prompt-count))
+                     t))
+                  ((symbol-function 'claude-emacs-bridge-start)
+                   (lambda ()
+                     (setq start-count (1+ start-count))
+                     (set-buffer coordinator)
+                     coordinator))
+                  ((symbol-function 'claude-emacs-bridge--resolve-target)
+                   (lambda ()
+                     (should (eq (current-buffer) source-buffer))
+                     (should (equal buffer-file-name "/tmp/example.go"))
+                     (setq resolve-count (1+ resolve-count))
+                     '((name . "task-1") (pid . 1))))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (string &optional _)
+                     (setq sent-string string)))
+                  ((symbol-function 'vterm-send-return) #'ignore)
+                  ((symbol-function 'message) #'ignore))
+          (with-temp-buffer
+            (setq source-buffer (current-buffer))
+            (setq buffer-file-name "/tmp/example.go")
+            (insert "line\n")
+            (set-buffer-modified-p nil)
+            (claude-emacs-bridge-send 1 2 "Review this line."))
+          (should (= prompt-count 1))
+          (should (= start-count 1))
+          (should (= resolve-count 1))
+          (should (string-match-p "Instruction: Review this line\\." sent-string))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should
+             (string-prefix-p
+              "Status: Claude coordinator is not running.\n\n"
+              (buffer-string)))
+            (should (string-match-p "Message: Review this line\\."
+                                    (buffer-string)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name))
+      (kill-buffer coordinator))))
+
+(ert-deftest claude-emacs-bridge-send-test/declines-missing-coordinator ()
+  "Declining the prompt logs the status and stops before target resolution."
   (let ((claude-emacs-bridge-buffer-name
-         "*claude-emacs-bridge-missing-test*"))
-    (with-temp-buffer
-      (setq buffer-file-name "/tmp/example.go")
-      (insert "line\n")
-      (set-buffer-modified-p nil)
-      (should-error
-       (claude-emacs-bridge-send 1 2 "Review this line.")
-       :type 'user-error))))
+         (generate-new-buffer-name "*claude-emacs-bridge-decline-test*"))
+        (claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*claude-emacs-bridge-decline-log-test*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+                  ((symbol-function 'claude-emacs-bridge-start)
+                   (lambda () (ert-fail "A declined prompt must not start")))
+                  ((symbol-function 'claude-emacs-bridge--resolve-target)
+                   (lambda () (ert-fail "A declined prompt must not resolve")))
+                  ((symbol-function 'vterm-send-string)
+                   (lambda (&rest _) (ert-fail "A declined prompt must not send")))
+                  ((symbol-function 'message) #'ignore))
+          (with-temp-buffer
+            (setq buffer-file-name "/tmp/example.go")
+            (insert "line\n")
+            (set-buffer-modified-p nil)
+            (should-not
+             (claude-emacs-bridge-send 1 2 "Review this line.")))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should
+             (equal (buffer-string)
+                    "Status: Claude coordinator is not running.\n\n"))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
 
 (ert-deftest claude-emacs-bridge-send-test/interactive-rejects-empty-instruction ()
   "Pressing RET on an empty instruction does not resolve or send a target."

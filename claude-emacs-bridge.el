@@ -227,17 +227,20 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
     session))
 
 (defun claude-emacs-bridge--coordinator-buffer ()
-  "Return the running Claude Code coordinator vterm."
+  "Return the running Claude Code coordinator vterm.
+Offer to start it when it is not running, returning nil when declined."
   (let ((buffer (get-buffer claude-emacs-bridge-buffer-name)))
-    (unless (and buffer
-                 (buffer-local-value
-                  'claude-emacs-bridge--coordinator-p buffer)
-                 (with-current-buffer buffer
-                   (derived-mode-p 'vterm-mode))
-                 (vterm-check-proc buffer))
-      (user-error
-       "Claude coordinator is not running; run M-x claude-emacs-bridge-start"))
-    buffer))
+    (if (and buffer
+             (buffer-local-value
+              'claude-emacs-bridge--coordinator-p buffer)
+             (with-current-buffer buffer
+               (derived-mode-p 'vterm-mode))
+             (vterm-check-proc buffer))
+        buffer
+      (claude-emacs-bridge--log-status
+       "Claude coordinator is not running.")
+      (when (y-or-n-p "Claude coordinator is not running; start it now? ")
+        (claude-emacs-bridge-start)))))
 
 (defun claude-emacs-bridge--log-message
     (session file start-line end-line instruction)
@@ -250,10 +253,22 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
         (goto-char (point-max))
         (insert (format (concat "Target: %s\n"
                                 "File: %s\n"
-                                "Lines: %d-%d\n"
+                                "Lines: %d:%d\n"
                                 "Message: %s\n\n")
                         (alist-get 'name session)
                         file start-line end-line instruction)))
+      (unless (derived-mode-p 'special-mode)
+        (special-mode)))
+    buffer))
+
+(defun claude-emacs-bridge--log-status (status)
+  "Append STATUS to the bridge log."
+  (let ((buffer (get-buffer-create
+                 claude-emacs-bridge-log-buffer-name)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "Status: %s\n\n" status)))
       (unless (derived-mode-p 'special-mode)
         (special-mode)))
     buffer))
@@ -291,7 +306,7 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
 (defun claude-emacs-bridge-clear ()
   "Send /clear to the Claude Code coordinator session."
   (interactive)
-  (let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
+  (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
     (with-current-buffer coordinator
       (vterm-send-string "/clear")
       (vterm-send-return))
@@ -313,28 +328,30 @@ Code session what to do.  Source text is not sent."
   (when (or (not (stringp instruction))
             (string-empty-p (string-trim instruction)))
     (user-error "Instruction cannot be empty"))
-  (let* ((range (claude-emacs-bridge--line-range beg end))
-         (coordinator (claude-emacs-bridge--coordinator-buffer)))
-    (let* ((session (claude-emacs-bridge--resolve-target))
-           (file (expand-file-name buffer-file-name))
-           (prompt
-            (claude-emacs-bridge--format-prompt
-             session
-             file
-             (car range)
-             (cdr range)
-             instruction)))
-      (with-current-buffer coordinator
-        (vterm-send-string prompt t)
-        (vterm-send-return))
-      (claude-emacs-bridge--log-message
-       session file (car range) (cdr range) instruction)
-      (message "Sent to %s: %s lines %d-%d; logged in %s"
-               (alist-get 'name session)
+  (let ((range (claude-emacs-bridge--line-range beg end))
+        (file (expand-file-name buffer-file-name))
+        (source-buffer (current-buffer)))
+    (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
+      (let* ((session
+              (with-current-buffer source-buffer
+                (claude-emacs-bridge--resolve-target)))
+             (prompt
+              (claude-emacs-bridge--format-prompt
+               session
                file
                (car range)
                (cdr range)
-               claude-emacs-bridge-log-buffer-name))))
+               instruction)))
+        (with-current-buffer coordinator
+          (vterm-send-string prompt t)
+          (vterm-send-return))
+        (claude-emacs-bridge--log-message
+         session file (car range) (cdr range) instruction)
+        (message "Sent to %s: %s lines %d-%d"
+                 (alist-get 'name session)
+                 file
+                 (car range)
+                 (cdr range))))))
 
 (provide 'claude-emacs-bridge)
 ;;; claude-emacs-bridge.el ends here

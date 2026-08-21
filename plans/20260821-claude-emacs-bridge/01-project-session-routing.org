@@ -1,6 +1,6 @@
 :PROPERTIES:
 :STATUS: IN-PROGRESS
-:STATUS_UPDATED_ON: 2026-08-21 16:00
+:STATUS_UPDATED_ON: 2026-08-21 18:52
 :END:
 #+title: Project Session Routing
 #+date: 2026-08-21
@@ -42,6 +42,14 @@ current Emacs process.
   =claude-emacs-bridge--= reserved for internal functions and variables.
 - [X] Doom loads the local package with =use-package!= and no longer owns a
   sibling bridge library or bridge test file.
+- [X] A send with no running coordinator logs the missing-coordinator status
+  and asks whether to start it.
+- [X] Accepting the prompt starts the coordinator and continues the original
+  send without asking for the instruction again.
+- [X] Declining the prompt stops without resolving a target or sending data.
+- [X] A running coordinator preserves the direct send path without prompting.
+- [X] Auto-start preserves the source file and routing context after vterm
+  switches the current buffer to the coordinator.
 
 * Verified Facts
 
@@ -138,6 +146,26 @@ current Emacs process.
 - Verification: 32 ERT tests passed in isolated and running Doom Emacs. Local
   =use-package= loading, running Doom =use-package!= loading, byte compilation,
   Checkdoc, =check-parens=, and =git diff --check= passed.
+
+** DONE Start the coordinator on demand
+
+- Log the missing-coordinator status in the bridge log buffer.
+- Ask with =y-or-n-p= whether to start the coordinator.
+- Continue the pending send after an accepted start.
+- Stop quietly after a declined start.
+- Add direct regression coverage for accepted, declined, and already-running
+  paths.
+- Verification: 35 ERT tests passed in isolated and running Doom Emacs. Byte
+  compilation, Checkdoc, =check-parens=, and =git diff --check= passed.
+
+** DONE Preserve source context during auto-start
+
+- Capture the source file before starting the coordinator.
+- Resolve the target using the original source buffer after vterm switches to
+  the coordinator.
+- Add regression coverage for the real buffer-switching behavior.
+- Verification: 35 ERT tests passed in isolated and running Doom Emacs. Byte
+  compilation, Checkdoc, =check-parens=, and =git diff --check= passed.
 
 * Decisions
 
