@@ -187,10 +187,7 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
                   "BEGIN TARGET MESSAGE\n"
                   "File: %s\n"
                   "Lines: %d-%d\n"
-                  "Instruction: %s\n\n"
-                  "After completing the instruction, send exactly ACK to "
-                  "emacs-server using SendMessage. Send no other text in "
-                  "that message.\n"
+                  "Instruction: %s\n"
                   "END TARGET MESSAGE")
           (alist-get 'name session)
           file start-line end-line instruction))

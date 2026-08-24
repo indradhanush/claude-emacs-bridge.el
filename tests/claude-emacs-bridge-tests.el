@@ -259,10 +259,7 @@
                     "BEGIN TARGET MESSAGE\n"
                     "File: /tmp/example.go\n"
                     "Lines: 4-7\n"
-                    "Instruction: Review these lines.\n\n"
-                    "After completing the instruction, send exactly ACK to "
-                    "emacs-server using SendMessage. Send no other text in "
-                    "that message.\n"
+                    "Instruction: Review these lines.\n"
                     "END TARGET MESSAGE")))
     (should-not (string-match-p "selected text" prompt))))
 
@@ -469,10 +466,7 @@
                           "BEGIN TARGET MESSAGE\n"
                           "File: /tmp/example.go\n"
                           "Lines: 1-2\n"
-                          "Instruction: Review these lines.\n\n"
-                          "After completing the instruction, send exactly "
-                          "ACK to emacs-server using SendMessage. Send no "
-                          "other text in that message.\n"
+                          "Instruction: Review these lines.\n"
                           "END TARGET MESSAGE")))
           (should-not (string-match-p "secret source text" sent-string))
           (should sent-paste-p)
