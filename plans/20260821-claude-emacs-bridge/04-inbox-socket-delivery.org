@@ -67,39 +67,67 @@ Every outcome looks the same from the sending side:
 - The coordinator session, its startup command, the =DO_NOT_TRACK= workaround,
   and the start and clear commands all go away.
 
-* What This Costs
+* Confirming A Send
 
-Emacs learns only that a live socket accepted some bytes. It cannot tell
-delivered from held from malformed. Today the coordinator at least says out loud
-when it could not deliver, even if Emacs never sees it.
+Nothing is written back on the connection itself, so a bare send tells Emacs
+only that a live socket accepted some bytes. Status arrives out of band instead,
+and this now works end to end.
 
-There is a documented way to close this. The receiver sends status out of band:
-it opens a fresh connection to whatever address the =from= field names and
-writes a =peer_message_status= control frame, with =status= one of =held=,
-=denied=, =expired=, =delivered=, =refused=, or =dropped=. To receive those,
-Emacs has to bind its own socket inside the same directory and pass its address
-as =uds:<escaped-path>=. That code path has been read but never executed.
+Emacs binds its own socket, names it in the =from= field, and the receiver opens
+a fresh connection to it to report what happened. Verified live:
+
+- Bind a listening socket inside =/tmp/cc-socks/=. The receiver vets the
+  namespace, not the filename: =emacs-bridge-receipt.sock= was accepted, so the
+  name does not have to look like =<pid>.sock=.
+- Send =from= as =uds:= followed by the percent-encoded socket path, and a
+  =msg_id= UUID to correlate with.
+- A failing target connects back within seconds and writes one
+  =peer_message_status= frame carrying =orig_msg_id= and a reason written for a
+  human to read.
+
+Observed frames:
+
+- Held target :: =status: held=, reason naming the recipient's approval step.
+- Refusing target :: =status: expired=, =status_detail: refused=, reason
+  explaining the recipient is not accepting cross-session messages.
+
+** Only failures are reported
+
+A target that accepted the message and acted on it sent nothing back. Confirmed
+by checking that it did in fact reply to the prompt.
+
+So this is a negative acknowledgement. A frame means the send failed and carries
+a reason worth showing. Silence means it probably worked, bounded by however
+long Emacs is willing to wait. That is weaker than a delivery receipt, and it is
+still far better than the relay, where a failure is a sentence of prose in a
+terminal that Emacs never reads.
 
 * Open Questions
 
 - Whether a target running in =bypassPermissions= mode holds the message. The
   docs suggest it does by default. Untested: starting such a session requires
   accepting an interactive security confirmation, which was not done without
-  asking. The =hold= test above stands in for what that failure looks like.
-- Whether binding a receipt socket actually delivers status frames. This decides
-  whether a send can be confirmed rather than merely attempted.
+  asking. The =hold= test stands in for what that failure looks like, and the
+  receipt frame it produces is the same one this case would produce.
 - Whether target discovery should switch from =claude agents --json= to reading
   =~/.claude/sessions/*.json=. The registry is what carries
   =messagingSocketPath=, so it answers reachability directly instead of by proxy
-  through =kind=.
+  through =kind=. It also removes a subprocess from every send.
+- How long Emacs should wait for a status frame before treating silence as
+  success. Both observed frames arrived within seconds, but that is two
+  observations on an idle machine.
+- What owns the receipt socket's lifetime. It has to be bound while a send is in
+  flight, cleaned up afterwards, and it has to cope with a stale file left by a
+  crashed Emacs.
 
 * Next Steps
 
-- [ ] Spike the receipt socket. Bind one, pass =uds:<path>= as =from=, send to a
-  held target and a live one, and see which status frames arrive. This decides
-  whether the redesign can report failures.
-- [ ] Decide on discovery: registry files or the CLI listing.
-- [ ] Only then write the implementation plan.
-- Context: viability is settled. What is unsettled is whether a send can be
-  confirmed, and that is worth knowing before any code is written, because
-  silent delivery failure is the bug this whole redesign exists to remove.
+- [ ] Decide on discovery: the session registry files or the CLI listing.
+- [ ] Decide the wait window for a status frame, and what a send reports when
+  the window closes quietly.
+- [ ] Write the implementation plan. It should cover the receipt socket's
+  lifetime, what replaces the start and clear commands, and whether the
+  coordinator is deleted outright or kept behind an option for a while.
+- Context: both gating questions are answered. Delivery from outside a session
+  works, and failures come back with a reason attached. What is left is design,
+  not feasibility.
