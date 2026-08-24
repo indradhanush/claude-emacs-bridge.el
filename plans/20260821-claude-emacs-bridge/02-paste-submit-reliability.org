@@ -1,0 +1,240 @@
+:PROPERTIES:
+:STATUS: IN-PROGRESS
+:STATUS_UPDATED_ON: 2026-08-24 15:30
+:END:
+#+title: Paste Submit Reliability
+#+date: 2026-08-24
+
+* Objective
+
+Messages sent through the bridge sometimes never reach the coordinator. The
+text lands in the coordinator's input box as a collapsed paste and sits there
+unsent until someone opens the buffer and presses RET by hand. Make a send
+either arrive or say plainly that it did not.
+
+* The Bug
+
+** Symptom
+
+About half of all sends. The coordinator vterm shows the message collapsed as
+=[5 lines pasted]= on the input line. Claude Code never starts a turn. Opening
+the buffer and pressing RET submits it normally, so the text is intact and the
+input box is in a submittable state. Only the carriage return was lost.
+
+** Root cause
+
+=claude-emacs-bridge-send= pastes the prompt and then sends RET with nothing in
+between:
+
+#+begin_src elisp
+(vterm-send-string prompt t)   ; bracketed paste
+(vterm-send-return)            ; raw \C-m
+#+end_src
+
+Claude Code receives the paste and converts it into its pending-input widget.
+That conversion is not instant. A carriage return that arrives before it
+finishes is swallowed. The bridge has no synchronization with that conversion,
+so whether the RET lands is a race.
+
+** What is not the cause
+
+Byte ordering. =Fvterm_update= flushes to the pty synchronously at the end of
+every call (=vterm-module.c:900=, =term_flush_output= calling
+=vterm--flush-output=). The RET can never overtake the paste bytes. This was
+checked and ruled out first.
+
+* Verified Facts
+
+- =vterm-send-string= returns 2.4–42.8 ms after it starts, measured over 42
+  trials. Its trailing =accept-process-output= carries a 100 ms timeout but
+  returns on the first byte of output, so it does not wait. The gap before the
+  RET is therefore variable and short.
+- Immediately after =vterm-send-string= returns, Claude Code has sometimes not
+  rendered the paste yet. Observed at the 2.9 ms end of that range.
+- The failure did not reproduce against a freshly started session: 42 of 42
+  sends submitted, across idle, mid-turn, back-to-back, and full-size payloads.
+  The race is real but this machine's fresh sessions win it consistently, so a
+  timing-based fix cannot be verified locally.
+- The same symptom and the same cause are reported against another tool driving
+  Claude Code the same way, in
+  [[https://github.com/obra/claude-session-driver/issues/20][obra/claude-session-driver#20]].
+  Its =sleep 0.1= between paste and Enter is reported there as unreliable.
+- No published delay value is known to work. The one project with this exact
+  bug moved away from a fixed delay toward polling for the pending-paste state.
+- A paste with no RET at all is detected and rescued by the shipped fix in
+  723 ms, against a real Claude Code session. This is the closest thing to a
+  live reproduction available: the stuck state is induced deliberately rather
+  than waited for.
+
+* Tasks
+
+** DONE Recover a swallowed carriage return
+
+Poll the coordinator's input box after sending RET. While the paste placeholder
+is still there, send RET again, up to a bounded number of attempts. No fixed
+delay is used, so nothing depends on guessing Claude Code's conversion time.
+
+New in =claude-emacs-bridge.el=:
+
+- =claude-emacs-bridge--pending-paste-p= reads the last
+  =claude-emacs-bridge--paste-tail-window= characters of the buffer, so a
+  placeholder left in the scrollback by an earlier message is not mistaken for
+  live input.
+- =claude-emacs-bridge--wait-for-paste-clear= watches for one resend interval
+  and returns as soon as the input box clears.
+- =claude-emacs-bridge--await-submit= drives the two above and resends RET,
+  bounded by =claude-emacs-bridge-submit-max-resends=.
+
+=claude-emacs-bridge-send= now reports success only when the input box actually
+cleared. Otherwise it logs =may not have been submitted= and names the buffer to
+check, so a lost message is visible instead of silent.
+
+The placeholder text belongs to Claude Code, so
+=claude-emacs-bridge-paste-placeholder-regexp= is a user option rather than a
+constant. It matches both =[5 lines pasted]= and =[Pasted text #1 +11 lines]=.
+
+** TODO Decide whether to move to the inbox socket
+
+See [[*Option 2: Post To The Inbox Socket][Option 2]] below. Needs a spike
+first, not code.
+
+* Option 2: Post To The Inbox Socket
+
+The retry recovers from the race. It does not remove it. Claude Code has a
+documented path that removes it, along with the coordinator session entirely.
+
+** Shape
+
+#+begin_example
+today:  Emacs -> paste into vterm -> coordinator Claude -> SendMessage -> target
+socket: Emacs -> /tmp/cc-socks/<pid>.sock -> target
+#+end_example
+
+Emacs finds the target in =~/.claude/sessions/<pid>.json=, reads
+=messagingSocketPath=, and writes to it directly. No vterm, paste or keypress.
+
+** What it removes
+
+- The race. No terminal or carriage return is involved, so it cannot occur.
+- The coordinator session: the =*claude-emacs-server*= buffer, the startup
+  command, the =DO_NOT_TRACK= workaround, and the start and clear commands.
+- The relay's own failure mode. The coordinator is a Haiku session guessing at a
+  target name from the prompt text, and it does get this wrong. An observed
+  failure: =Not sent — no agent named 'byohctl-ci-integration' is reachable=.
+  Socket delivery is addressed by pid, so it cannot misroute.
+
+** Wire format
+
+Read out of the compiled binary at
+=~/.local/share/claude/versions/2.1.241= and confirmed by live probe.
+
+Newline-delimited JSON, one object per line. No length prefix. Line buffer cap
+is 1048576 characters; exceeding it drops the connection.
+
+Minimal working frame on macOS and Linux:
+
+#+begin_example
+{"type":"user","message":{"content":"hello"}}\n
+#+end_example
+
+With the optional auth line first:
+
+#+begin_example
+{"type":"auth","token":"<CLAUDE_CODE_MESSAGING_TOKEN>"}\n
+{"type":"user","message":{"content":"hello"},"from":"emacs-bridge","priority":"next"}\n
+#+end_example
+
+Field notes:
+
+- =type= :: required. =user= is an inbox message. =control= and =auth= are the
+  other accepted values; anything else is dropped.
+- =message.content= :: required, must be a non-empty string, not an array. It is
+  injected as the prompt verbatim.
+- =message.role= :: never read by the receiver.
+- =from= :: optional reply address, defaults to =unknown=. Status receipts only
+  flow back when it is shaped =uds:<escaped-socket-path>= inside the same
+  sockets directory.
+- =msg_id= :: optional, must be a UUID or it is ignored.
+- =priority= :: =now=, =next=, or =later=. Anything else falls back to =next=.
+- =session_id= :: if present it must equal the target's session id, or the frame
+  is dropped. Omit it.
+
+** The catch
+
+There is no reply on the connection. Four probes, including malformed JSON and
+a frame with missing content, all returned zero bytes. Failures are silent to
+the sender and appear only in the receiver's own debug log. Status travels out
+of band: the receiver opens a fresh connection to whatever =from= address was
+given and sends a =peer_message_status= control frame there, with =status= one
+of =held=, =denied=, =expired=, =delivered=, =refused=, or =dropped=. Reading
+those means Emacs has to bind its own socket in the same directory.
+
+Today the coordinator at least says out loud when it could not deliver. The
+socket path gives up that feedback unless the receipt socket is built too.
+
+** Open question, and it decides everything
+
+The frame format was probed from a process running inside a session, so
+ancestry checks passed. A real Emacs process is outside the session tree and
+carries no ancestry and no token. Per the docs it then asserts no permission
+class, and a target running in =bypassPermissions= mode holds the message for
+approval rather than delivering it.
+
+If that is what happens, the socket path silently does nothing for exactly the
+sessions most likely to be targets. This was not testable from inside a session
+and has to be answered before any code is written.
+
+* Decisions
+
+- [2026-08-24] Ship the retry now, keep the coordinator. The race is confirmed
+  but not locally reproducible, so a fix that recovers from it is verifiable
+  where a fix that tries to avoid it is not.
+- [2026-08-24] Detect the stuck state rather than sleep through it. No fixed
+  delay is known to work, and the placeholder is directly observable.
+- [2026-08-24] Bound the resends. A coordinator wedged for some unrelated reason
+  should not be flooded with carriage returns.
+- [2026-08-24] Keep the placeholder pattern a user option. It is third-party UI
+  text and will change without notice.
+- [2026-08-24] Treat the socket redesign as a separate piece of work gated on the
+  permission question, not as part of this fix.
+
+* Rejected Approaches
+
+- Fixed delay between paste and RET – no known-good value. The one project with
+  this exact bug reports its 0.1 s as unreliable and moved to state polling.
+- Reordering or merging the two sends – ordering was ruled out. The pty already
+  receives the bytes in order.
+- Sending the prompt as a single line to avoid bracketed paste – would lose the
+  prompt's structure, and long single-line input may still collapse. Not tested.
+- Socket path with a vterm fallback – gains the socket's benefits only when it
+  works, and leaves both paths to maintain and test forever.
+
+* Verification
+
+- Isolated Emacs: 46 ERT tests pass, 0 unexpected. Was 35 before this work.
+- Running Doom Emacs: 46 ERT tests pass, 0 unexpected.
+- Byte-compile clean, checkdoc clean.
+- Live, against a real Claude Code session in a throwaway vterm:
+  - idle input box reports no pending paste
+  - a paste with RET deliberately withheld is detected as pending
+  - =claude-emacs-bridge--await-submit= rescues that stuck paste in 723 ms
+  - 6 of 6 ordinary sends submit, so the retry adds no regression
+
+New tests cover each helper directly, plus two regressions on
+=claude-emacs-bridge-send=: one where the first RET is swallowed and the resend
+succeeds, and one where submission never lands and the failure must be logged
+rather than reported as success.
+
+* Next Steps
+
+- [ ] Use the bridge normally for a while and watch the log buffer for
+      =may not have been submitted=. That line appearing means the bound of
+      three resends is too low; that line never appearing while sends still
+      go missing means the placeholder regexp no longer matches.
+- [ ] Spike the permission question in [[*Open question, and it decides everything][Open question]]
+      before writing any socket code. Post a frame to a session's socket from a
+      process outside the session tree, with that session in
+      =bypassPermissions= mode, and see whether it is delivered or held.
+- [ ] Only if that spike passes: plan the socket redesign as its own file.
+- Context: the retry fix is shipped and verified. The socket work is blocked on
+  one untested question, and the answer decides whether it is viable at all.
