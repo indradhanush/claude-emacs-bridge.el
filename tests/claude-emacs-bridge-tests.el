@@ -274,6 +274,60 @@ An empty picker is a loud failure; offering an unreachable target is a quiet one
                 (buffer-string))))
           (kill-buffer buffer))))))
 
+(ert-deftest claude-emacs-bridge--escape-mentions-test/escapes-a-path ()
+  "A path written as an at-mention is escaped so no file is attached."
+  (should (equal (claude-emacs-bridge--escape-mentions "inline it into @/tmp/x.sh")
+                 "inline it into \\@/tmp/x.sh")))
+
+(ert-deftest claude-emacs-bridge--escape-mentions-test/escapes-every-mention ()
+  "Every at-mention in the text is escaped, not only the first."
+  (should (equal (claude-emacs-bridge--escape-mentions "@a.txt and @b.txt")
+                 "\\@a.txt and \\@b.txt")))
+
+(ert-deftest claude-emacs-bridge--escape-mentions-test/leaves-a-bare-at-sign ()
+  "An at sign followed by whitespace cannot start a mention and is left alone."
+  (should (equal (claude-emacs-bridge--escape-mentions "priced at @ 5 dollars")
+                 "priced at @ 5 dollars")))
+
+(ert-deftest claude-emacs-bridge--escape-mentions-test/leaves-a-trailing-at-sign ()
+  "An at sign at the end of the text has nothing to expand."
+  (should (equal (claude-emacs-bridge--escape-mentions "ends with @")
+                 "ends with @")))
+
+(ert-deftest claude-emacs-bridge--escape-mentions-test/escapes-inside-an-address ()
+  "An address is escaped too.
+Claude Code decides what a mention is; the bridge does not try to outguess it."
+  (should (equal (claude-emacs-bridge--escape-mentions "ask dhanush@example.com")
+                 "ask dhanush\\@example.com")))
+
+(ert-deftest claude-emacs-bridge--format-prompt-test/escapes-mentions-in-the-instruction ()
+  "An at-mention in the instruction reaches the target without being expanded."
+  (let ((prompt (claude-emacs-bridge--format-prompt
+                 '((name . "task-1"))
+                 "/tmp/example.go" 4 7
+                 "inline it into @/tmp/download.sh")))
+    (should (string-match-p "Instruction: inline it into \\\\@/tmp/download\\.sh"
+                            prompt))))
+
+(ert-deftest claude-emacs-bridge--format-prompt-test/keeps-the-target-mention ()
+  "The target's own mention is left intact so the coordinator can still route."
+  (let ((prompt (claude-emacs-bridge--format-prompt
+                 '((name . "task-1"))
+                 "/tmp/example.go" 4 7 "Review these lines.")))
+    (should (string-match-p "send @task-1 the exact content" prompt))
+    (should-not (string-match-p "send \\\\@task-1" prompt))))
+
+(ert-deftest claude-emacs-bridge-startup-command-test/locks-the-coordinator-down ()
+  "The coordinator starts unable to read files.
+Claude Code attaches @path contents before the model runs, so a relay that
+can read is a relay that leaks whatever a path in an instruction points at."
+  (should (string-match-p "--tools SendMessage,ListAgents"
+                          claude-emacs-bridge--startup-command))
+  (should (string-match-p "--strict-mcp-config"
+                          claude-emacs-bridge--startup-command))
+  (should (string-match-p "Read(//\\*\\*)"
+                          claude-emacs-bridge--startup-command)))
+
 (ert-deftest claude-emacs-bridge--format-prompt-test/contains-only-location-and-instruction ()
   "The coordinator prompt contains path, lines, and instruction without source text."
   (let ((prompt
@@ -369,11 +423,8 @@ An empty picker is a loud failure; offering an unreachable target is a quiet one
                   ((symbol-function 'vterm-send-return)
                    (lambda () (setq return-sent t))))
           (should (eq (claude-emacs-bridge-start) created-buffer))
-          (should
-           (equal sent-string
-                  (concat "exec env -u DO_NOT_TRACK claude "
-                          "--model claude-haiku-4-5-20251001 "
-                          "--name emacs-server")))
+          (should (equal sent-string
+                         claude-emacs-bridge--startup-command))
           (should-not sent-paste-p)
           (should return-sent)
           (with-current-buffer created-buffer

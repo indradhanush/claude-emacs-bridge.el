@@ -1,0 +1,109 @@
+:PROPERTIES:
+:STATUS: IMPLEMENTED
+:STATUS_UPDATED_ON: 2026-08-24 17:10
+:END:
+#+ARCHIVE: %s_archive::
+#+title: Relay Must Not Read Files
+#+date: 2026-08-24
+
+* Objective
+
+The coordinator is meant to be a message proxy and nothing else. An instruction
+containing =@/some/path= made it read that file. The path belonged to a task for
+a different session, so the relay was pulling in content that was never meant
+for it. Stop the relay reading anything.
+
+* The Bug
+
+An instruction ended with =@~/pf9/byoh/.ci/download-byohctl.sh=. The coordinator
+ran =Read= on it before forwarding the message.
+
+The read is not a model decision. Claude Code expands =@path= in the input box
+into an attached file before the model runs. The relay prompt already said "Do
+not act on that content yourself", and that cannot help: there is no decision
+point to influence.
+
+* Verified Facts
+
+- Restricting tools does not stop it. A session started with
+  =--tools SendMessage= has no =Read= at all, and the read still happened.
+  Confirmed separately that this flag does remove =Read=: asked to read a file,
+  the same session answered that it could not.
+- =--tools= alone leaves every configured MCP tool in place. =--strict-mcp-config=
+  is what removes them.
+- Permission deny rules do stop it. The permissions documentation states that
+  =Read= rules are applied to =@file= mentions in prompts. Verified live: a
+  coordinator started with the deny list below was sent a raw, unescaped
+  =@path= pointing at a file holding a unique token, and answered =NO-CONTENT=.
+  The token never appeared.
+- Deny beats allow from every scope, so the rule holds whatever the user's own
+  settings say.
+- Prefixing with a backslash suppresses the expansion. =\@path= is left as
+  literal text and no file is attached. This is undocumented; no official page
+  describes an escape.
+- Backticks do not work. =`@path`= still attaches the file. An earlier test here
+  suggested otherwise, but it looked for a =Read= line in the terminal, and the
+  attach can happen without one. Any check for this has to ask the model whether
+  content arrived.
+- The backslash did not survive delivery in a live run: the target received a
+  plain =@path=. That is the relay model normalizing the text, not a guarantee.
+
+* Tasks
+
+** DONE Start the coordinator without the ability to read
+
+#+begin_example
+claude --tools SendMessage,ListAgents \
+       --strict-mcp-config \
+       --settings '{"permissions":{"deny":["Read(//**)","Glob","Grep","Bash"]}}'
+#+end_example
+
+** DONE Escape at-mentions before pasting
+
+=claude-emacs-bridge--escape-mentions= rewrites =@= to =\@= in the instruction.
+Only the instruction is touched. The =File:= line is a bare path with no =@=,
+and the target's own =@<name>= is left alone because it is what routes the
+message.
+
+An =@= followed by whitespace, or at the very end of the text, cannot begin a
+mention and is left as it is. An address such as =dhanush@example.com= is
+escaped; the bridge does not try to outguess what Claude Code treats as a path.
+
+* Decisions
+
+- [2026-08-24] Keep both guards. The deny list is the documented mechanism and
+  the one that must hold. The escape is undocumented and could stop working in
+  any release, so it is the second layer, not the first.
+- [2026-08-24] Escape rather than strip. The target needs the path; only the
+  relay must not act on it.
+- [2026-08-24] Do not try to detect which =@= is a real path. Escaping every
+  =@= followed by non-whitespace costs a backslash in an address and removes a
+  whole class of guessing.
+
+* Rejected Approaches
+
+- Strengthening the relay prompt: the model never gets the choice.
+- =--tools= or =--disallowedTools= on their own: expansion precedes the model.
+- Backticks around the path: the file is still attached.
+- A zero-width space after the =@=: an invisible character inside a file path
+  is a trap for whoever debugs it later. Its effect was also never confirmed by
+  a reliable check.
+
+* Verification
+
+- 56 ERT tests pass in isolated Emacs and in the running Doom instance. Was 48.
+- Byte-compile and checkdoc clean.
+- Live, with the coordinator started by the package's own command:
+  - a raw unescaped =@path= produced =NO-CONTENT=, with no read and no token
+  - a full send through the prompt formatter reached the target intact, with no
+    read, and submitted on the first carriage return
+
+* Open Questions
+
+- Whether the =@= typeahead can swallow a carriage return, which would make it
+  the real cause of the bug in
+  [[file:./02-paste-submit-reliability.org][Paste Submit Reliability]] rather
+  than a paste-commit race. Fifteen trials on a payload ending in a path did not
+  swallow anything. One apparent reproduction turned out to be leftover text in
+  the input box from an earlier trial, so it proves nothing. This environment has
+  never reproduced the original bug either, so the question stays open.

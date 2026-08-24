@@ -68,8 +68,18 @@ being mistaken for input that is still waiting to be sent.")
 (defconst claude-emacs-bridge--startup-command
   (concat "exec env -u DO_NOT_TRACK claude "
           "--model claude-haiku-4-5-20251001 "
+          "--tools SendMessage,ListAgents "
+          "--strict-mcp-config "
+          "--settings '{\"permissions\":{\"deny\":"
+          "[\"Read(//**)\",\"Glob\",\"Grep\",\"Bash\"]}}' "
           "--name emacs-server")
-  "Command used to start the coordinator in its dedicated vterm.")
+  "Command used to start the coordinator in its dedicated vterm.
+The coordinator only relays messages, so it is started without the tools to do
+anything else.  The deny rules matter separately from the tool list: Claude Code
+attaches the contents of an @path before the model runs, and a Read deny is what
+stops that.  Without it a path inside an instruction meant for another session
+would be read here.  Deny beats allow from every scope, so this holds whatever
+the user's own settings say.")
 
 (defvar claude-emacs-bridge--targets (make-hash-table :test 'equal)
   "Active Claude process identity associated with each Emacs context key.")
@@ -212,6 +222,17 @@ When BEG and END are equal, return the line containing that position."
    (t
     (user-error "Range start must not follow range end"))))
 
+(defun claude-emacs-bridge--escape-mentions (text)
+  "Return TEXT with each at-mention escaped.
+Claude Code expands @path into an attached file at input time, before the model
+runs, so an unescaped path in an instruction is read by the coordinator instead
+of being passed along.  A backslash stops the expansion and leaves the path
+readable, which is what the target needs.
+
+Only the instruction is escaped.  The target's own @<name> elsewhere in the
+prompt is what routes the message and is left alone."
+  (replace-regexp-in-string "@\\([^[:space:]]\\)" "\\\\@\\1" text t))
+
 (defun claude-emacs-bridge--format-prompt
     (session file start-line end-line instruction)
   "Build a coordinator prompt for SESSION, FILE, and its inclusive line range.
@@ -225,7 +246,8 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
                   "Instruction: %s\n"
                   "END TARGET MESSAGE")
           (alist-get 'name session)
-          file start-line end-line instruction))
+          file start-line end-line
+          (claude-emacs-bridge--escape-mentions instruction)))
 
 (defun claude-emacs-bridge-list-sessions ()
   "Display active local Claude sessions that can receive bridge messages."

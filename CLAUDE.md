@@ -50,6 +50,30 @@ The buffer-local `claude-emacs-bridge--coordinator-p` flag marks a vterm the
 package created. A buffer with the right name but without the flag is a name
 collision and is rejected, never reused or killed.
 
+### The coordinator must not read files
+
+Claude Code expands `@path` in the input box into an attached file *before the
+model runs*. That is not a tool call, so restricting the coordinator's tools
+does not stop it, and neither does telling it in the prompt not to read
+anything. A path inside an instruction meant for another session was being read
+by the relay.
+
+Two independent guards, both needed.
+
+- The coordinator starts with a permission deny list. The docs state that
+  `Read` rules apply to `@file` mentions, and that is the only supported
+  mechanism that stops the attach. Deny beats allow from every scope, so a
+  user's own settings cannot re-enable it. `--tools` and `--strict-mcp-config`
+  narrow the relay to the messaging tools; without `--strict-mcp-config` every
+  configured MCP tool stays available.
+- `claude-emacs-bridge--escape-mentions` rewrites `@` to `\@` in the
+  instruction before it is pasted, so no expansion is attempted at all. The
+  escape is undocumented behaviour found by testing, which is why it is the
+  second guard and not the first.
+
+The target's own `@<name>` in the relay prompt is deliberately left unescaped;
+that is what routes the message.
+
 ### Submitting a paste is a race
 
 Emacs pastes the prompt and then sends RET. Claude Code needs a moment to turn a
