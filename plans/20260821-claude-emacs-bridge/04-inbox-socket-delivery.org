@@ -91,43 +91,155 @@ Observed frames:
 - Refusing target :: =status: expired=, =status_detail: refused=, reason
   explaining the recipient is not accepting cross-session messages.
 
-** Only failures are reported
+** Receipts only ever report failure
 
-A target that accepted the message and acted on it sent nothing back. Confirmed
-by checking that it did in fact reply to the prompt.
+A =delivered= status exists but reaches a sender on one path only: a message
+that was held, and that the recipient's user then approved. A message accepted
+straight away produces no receipt at all. The accept branch of the inbound gate
+returns without emitting one. Six accepted sends across both priorities, with
+and without =msg_id=, to idle and busy targets, produced zero frames.
 
-So this is a negative acknowledgement. A frame means the send failed and carries
-a reason worth showing. Silence means it probably worked, bounded by however
-long Emacs is willing to wait. That is weaker than a delivery receipt, and it is
-still far better than the relay, where a failure is a sentence of prose in a
-terminal that Emacs never reads.
+So receipts are a negative acknowledgement and cannot be the success signal.
+There is a better one.
+
+** Drops are reported, and one of them will happen in normal use
+
+=dropped= frames arrive fast, correlate by =orig_msg_id=, and carry a
+=drop_reason=. The reasons are =duplicate=, =rate-limited=, =queue-full=,
+=hop-loop= and =hop-runaway=.
+
+=duplicate= is the one that matters here. Identical content from the same sender
+within 30 seconds is dropped and never delivered. Sending the same instruction
+about the same lines twice in quick succession is an ordinary thing to do, so
+the bridge has to surface this rather than let it look like success.
+
+Other defaults worth knowing: sustained rate is one message every two seconds
+with a burst of thirty, and fifty undelivered peer messages fills the queue. The
+first drop in a sixty-second window is reported immediately; further drops are
+batched and arrive about five seconds later in one frame whose =dropped_msg_ids=
+names them.
+
+* Confirming Success
+
+The receiving session writes a line to its own transcript when a message is
+queued. That line is the success signal.
+
+#+begin_example
+{"type":"queue-operation","operation":"enqueue","timestamp":"...",
+ "sessionId":"...","content":"<the exact text that was sent>"}
+#+end_example
+
+- Path :: =~/.claude/projects/<slug>/<sessionId>.jsonl=, where =sessionId= comes
+  from the session registry and =slug= is the session's =cwd= with every
+  character outside =[A-Za-z0-9]= replaced by a dash. If that path is absent,
+  glob =~/.claude/projects/*/<sessionId>.jsonl= before concluding anything.
+- Correlation :: by exact =content= match. The record carries no =msg_id=. The
+  matching =dequeue= line has no content at all.
+- Meaning :: the line is written after admission, so its presence means the
+  message cleared the accept gate and the duplicate, rate and queue guards. It
+  is in the queue.
+- Timing :: the timestamp lands 1 to 18 ms after the send, and the writer
+  flushes on a 100 ms interval, so budget around 150 ms before it is readable.
+
+It can be absent for reasons that are not failure: transcript persistence turned
+off, history suppression, or a session so newly started that its file does not
+exist yet. Absence therefore means unconfirmed, not failed.
+
+* Knowing When The Target Finished
+
+Separate from delivery, a sender can ask to be told when the target next goes
+idle. Send a control frame:
+
+#+begin_example
+{"type":"control","action":"notify_when_idle","msgV":1,
+ "msg_id":"<uuid>","from":"uds:<path>"}
+#+end_example
+
+A =peer_idle_notice= comes back with =state= of =idle=, =exited= or
+=unavailable=, and =finished_at=. It fires once, 750 ms after the target's queue
+drains, so it means finished rather than briefly between tokens. Session death
+reports =exited= within milliseconds.
+
+The sharp edge: subscribing to an already idle target fires immediately, about a
+turn that ended before the subscription. Compare =finished_at= against the send
+time. Greater means a turn ended after the message. Anything else means the
+session was already idle and the message has not been worked through.
+
+Subscribe after sending, never before, or an idle target answers about the wrong
+turn. The target also tells its own user that something asked to be notified, so
+this is visible rather than silent.
+
+* Settled Design
+
+- Discovery reads =~/.claude/sessions/*.json=. It is no longer a preference: the
+  transcript path needs =sessionId= and =cwd=, and the idle subscription needs
+  =peerFeatures=. Only the registry carries them. It also drops a subprocess
+  from every send.
+- The wait for confirmation is 500 ms, roughly three times the worst measured
+  latency, with room for a loaded machine.
+- A send reports one of three outcomes. Transcript line found means delivered.
+  A status frame means failed, and its =reason= is already written for a human
+  to read. Neither means sent but unconfirmed, which is stated plainly rather
+  than dressed up as either.
 
 * Open Questions
 
-- Whether a target running in =bypassPermissions= mode holds the message. The
-  docs suggest it does by default. Untested: starting such a session requires
-  accepting an interactive security confirmation, which was not done without
-  asking. The =hold= test stands in for what that failure looks like, and the
-  receipt frame it produces is the same one this case would produce.
-- Whether target discovery should switch from =claude agents --json= to reading
-  =~/.claude/sessions/*.json=. The registry is what carries
-  =messagingSocketPath=, so it answers reachability directly instead of by proxy
-  through =kind=. It also removes a subprocess from every send.
-- How long Emacs should wait for a status frame before treating silence as
-  success. Both observed frames arrived within seconds, but that is two
-  observations on an idle machine.
 - What owns the receipt socket's lifetime. It has to be bound while a send is in
-  flight, cleaned up afterwards, and it has to cope with a stale file left by a
-  crashed Emacs.
+  flight, cleaned up afterwards, and cope with a stale file left by an Emacs
+  that crashed.
+- Whether a =bypassPermissions= target holds the message. The docs say it does.
+  Untested, because starting one needs an interactive security confirmation that
+  was not authorised. The =hold= case produces the same frame, so this is
+  unlikely to change the design.
+- Whether the relay path has been silently hitting the duplicate guard all
+  along. The coordinator sends through the same mechanism, so a repeated
+  instruction within thirty seconds would be dropped there too, and nothing in
+  the current bridge would notice.
+
+* Scope
+
+The bridge is in daily use. That constrains this work more than anything else
+in the plan.
+
+The relay stays the default. The socket path goes in behind an option that is
+off unless asked for, and the default only changes once the socket path has been
+tested properly and carried real traffic. A working setup does not get swapped
+out for an untested one.
+
+Development must not disturb the running coordinator or any live session.
+Experiments use throwaway sessions in a scratch directory, started and killed by
+the test itself, and never write to a socket belonging to a session someone is
+using.
+
+Nothing about the coordinator is deleted in this work. Removing it is a cleanup
+task for later, listed below so it is not lost, and so nobody mistakes the
+leftover relay code for something still load-bearing.
+
+* Cleanup
+
+Do these only after the socket path has been the default for long enough to
+trust, and only once nothing in the plans still points at the relay as a
+fallback.
+
+- [ ] Delete the coordinator vterm, its startup command, and the =DO_NOT_TRACK=
+  workaround that exists only because the relay is a Claude session.
+- [ ] Delete the start and clear commands.
+- [ ] Delete the submit recovery in
+  [[file:./02-paste-submit-reliability.org][Paste Submit Reliability]]. It has
+  nothing to guard once no paste happens.
+- [ ] Delete the at-mention escaping and the coordinator's deny settings from
+  [[file:./03-relay-must-not-read-files.org][Relay Must Not Read Files]]. Both
+  exist only because text was typed into an input box.
+- [ ] Drop the relay-shaped prompt wrapper. A socket message needs no
+  =BEGIN TARGET MESSAGE= markers and no instruction telling a model not to act
+  on what it is forwarding.
 
 * Next Steps
 
-- [ ] Decide on discovery: the session registry files or the CLI listing.
-- [ ] Decide the wait window for a status frame, and what a send reports when
-  the window closes quietly.
-- [ ] Write the implementation plan. It should cover the receipt socket's
-  lifetime, what replaces the start and clear commands, and whether the
-  coordinator is deleted outright or kept behind an option for a while.
-- Context: both gating questions are answered. Delivery from outside a session
-  works, and failures come back with a reason attached. What is left is design,
-  not feasibility.
+- [ ] Write the implementation plan, covering the receipt socket's lifetime and
+  the option that selects the socket path, defaulting to the relay.
+- [ ] Work out how the socket path gets tested without touching the coordinator
+  that is in daily use.
+- Context: feasibility and success detection are both settled. A send can be
+  positively confirmed, failures come back with a reason, and the remaining work
+  is writing the thing.
