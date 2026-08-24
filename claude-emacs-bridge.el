@@ -35,6 +35,36 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-paste-placeholder-regexp
+  "\\[[^]\n]*pasted[^]\n]*\\]"
+  "Regexp matching the collapsed paste Claude Code shows for unsent input.
+Claude Code renders a multi-line paste as a placeholder such as
+\"[5 lines pasted]\" until the message is submitted.  The wording belongs to
+Claude Code, so this is a user option rather than a constant."
+  :type 'regexp
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-submit-resend-interval 0.4
+  "Seconds to wait for a pasted message to be submitted before resending RET."
+  :type 'number
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-submit-poll-interval 0.05
+  "Seconds between checks of the coordinator's input box while waiting."
+  :type 'number
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-submit-max-resends 3
+  "How many extra carriage returns a stuck paste may be given.
+Bounded so a coordinator that is wedged for some other reason is not flooded."
+  :type 'integer
+  :group 'claude-emacs-bridge)
+
+(defconst claude-emacs-bridge--paste-tail-window 1000
+  "Characters at the end of the coordinator buffer that hold its input box.
+Searching only this window keeps an old placeholder in the scrollback from
+being mistaken for input that is still waiting to be sent.")
+
 (defconst claude-emacs-bridge--startup-command
   (concat "exec env -u DO_NOT_TRACK claude "
           "--model claude-haiku-4-5-20251001 "
@@ -309,6 +339,46 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
       (vterm-send-return))
     (message "Sent /clear to Claude coordinator emacs-server")))
 
+(defun claude-emacs-bridge--pending-paste-p (buffer)
+  "Return non-nil for an unsubmitted paste still in BUFFER's input box."
+  (with-current-buffer buffer
+    (let ((case-fold-search t)
+          (start (max (point-min)
+                      (- (point-max)
+                         claude-emacs-bridge--paste-tail-window))))
+      (string-match-p claude-emacs-bridge-paste-placeholder-regexp
+                      (buffer-substring-no-properties start (point-max))))))
+
+(defun claude-emacs-bridge--wait-for-paste-clear (buffer)
+  "Watch BUFFER for one resend interval.
+Return non-nil as soon as its pasted input is submitted."
+  (let ((deadline (+ (float-time)
+                     claude-emacs-bridge-submit-resend-interval)))
+    (catch 'cleared
+      (while t
+        (unless (claude-emacs-bridge--pending-paste-p buffer)
+          (throw 'cleared t))
+        (when (>= (float-time) deadline)
+          (throw 'cleared nil))
+        (sleep-for claude-emacs-bridge-submit-poll-interval)))))
+
+(defun claude-emacs-bridge--await-submit (buffer)
+  "Resend RET to BUFFER until its pasted message is submitted.
+Return non-nil once the input box clears.  Claude Code ignores a carriage
+return that arrives before it has turned a bracketed paste into pending
+input, which leaves the message sitting unsent in the input box."
+  (with-current-buffer buffer
+    (let ((resends 0)
+          (submitted nil))
+      (while (and (not submitted)
+                  (<= resends claude-emacs-bridge-submit-max-resends))
+        (setq submitted (claude-emacs-bridge--wait-for-paste-clear buffer))
+        (unless submitted
+          (setq resends (1+ resends))
+          (when (<= resends claude-emacs-bridge-submit-max-resends)
+            (vterm-send-return))))
+      submitted)))
+
 (defun claude-emacs-bridge-send (beg end instruction)
   "Send the file location from BEG to END to the coordinator.
 Equal endpoints send their current line.  INSTRUCTION tells the target Claude
@@ -344,11 +414,18 @@ Code session what to do.  Source text is not sent."
           (vterm-send-return))
         (claude-emacs-bridge--log-message
          session file (car range) (cdr range) instruction)
-        (message "Sent to %s: %s lines %d-%d"
-                 (alist-get 'name session)
-                 file
-                 (car range)
-                 (cdr range))))))
+        (if (claude-emacs-bridge--await-submit coordinator)
+            (message "Sent to %s: %s lines %d-%d"
+                     (alist-get 'name session)
+                     file
+                     (car range)
+                     (cdr range))
+          (let ((warning
+                 (format "Message to %s may not have been submitted; check %s"
+                         (alist-get 'name session)
+                         claude-emacs-bridge-buffer-name)))
+            (claude-emacs-bridge--log-status warning)
+            (message "%s" warning)))))))
 
 (provide 'claude-emacs-bridge)
 ;;; claude-emacs-bridge.el ends here

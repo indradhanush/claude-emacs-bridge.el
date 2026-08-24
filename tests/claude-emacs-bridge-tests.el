@@ -654,5 +654,186 @@
        (call-interactively #'claude-emacs-bridge-send)
        :type 'user-error))))
 
+;;; Paste submission recovery
+
+(ert-deftest claude-emacs-bridge--pending-paste-test/detects-collapsed-paste ()
+  "An input box holding a collapsed paste reports a pending paste."
+  (with-temp-buffer
+    (insert "> [5 lines pasted]\n")
+    (should (claude-emacs-bridge--pending-paste-p (current-buffer)))))
+
+(ert-deftest claude-emacs-bridge--pending-paste-test/detects-alternate-wording ()
+  "Detection does not depend on Claude Code's exact placeholder wording."
+  (with-temp-buffer
+    (insert "> [Pasted text #1 +11 lines]\n")
+    (should (claude-emacs-bridge--pending-paste-p (current-buffer)))))
+
+(ert-deftest claude-emacs-bridge--pending-paste-test/ignores-submitted-input ()
+  "A cleared input box reports no pending paste."
+  (with-temp-buffer
+    (insert "> \n")
+    (should-not (claude-emacs-bridge--pending-paste-p (current-buffer)))))
+
+(ert-deftest claude-emacs-bridge--pending-paste-test/ignores-old-scrollback ()
+  "A placeholder scrolled out of the input box does not count as pending."
+  (with-temp-buffer
+    (insert "> [5 lines pasted]\n")
+    (insert (make-string (* 4 claude-emacs-bridge--paste-tail-window) ?x))
+    (insert "\n> \n")
+    (should-not (claude-emacs-bridge--pending-paste-p (current-buffer)))))
+
+(ert-deftest claude-emacs-bridge--wait-for-paste-clear-test/returns-immediately ()
+  "Waiting returns at once when the input box is already clear."
+  (with-temp-buffer
+    (insert "> \n")
+    (let ((claude-emacs-bridge-submit-resend-interval 5.0)
+          (start (float-time)))
+      (should (claude-emacs-bridge--wait-for-paste-clear (current-buffer)))
+      (should (< (- (float-time) start) 1.0)))))
+
+(ert-deftest claude-emacs-bridge--wait-for-paste-clear-test/gives-up-after-interval ()
+  "Waiting stops after one resend interval while the paste is still pending."
+  (with-temp-buffer
+    (insert "> [5 lines pasted]\n")
+    (let ((claude-emacs-bridge-submit-resend-interval 0.15)
+          (claude-emacs-bridge-submit-poll-interval 0.01))
+      (should-not (claude-emacs-bridge--wait-for-paste-clear (current-buffer))))))
+
+(ert-deftest claude-emacs-bridge--await-submit-test/no-resend-when-already-submitted ()
+  "A carriage return that landed is not followed by another one."
+  (with-temp-buffer
+    (insert "> \n")
+    (let ((resends 0))
+      (cl-letf (((symbol-function 'vterm-send-return)
+                 (lambda () (setq resends (1+ resends)))))
+        (should (claude-emacs-bridge--await-submit (current-buffer))))
+      (should (= resends 0)))))
+
+(ert-deftest claude-emacs-bridge--await-submit-test/resends-until-input-clears ()
+  "A swallowed carriage return is resent until the input box clears."
+  (with-temp-buffer
+    (insert "> [5 lines pasted]\n")
+    (let ((resends 0)
+          (buffer (current-buffer))
+          (claude-emacs-bridge-submit-resend-interval 0.05)
+          (claude-emacs-bridge-submit-poll-interval 0.01))
+      (cl-letf (((symbol-function 'vterm-send-return)
+                 (lambda ()
+                   (setq resends (1+ resends))
+                   ;; The second carriage return is the one Claude Code takes.
+                   (when (= resends 2)
+                     (with-current-buffer buffer
+                       (erase-buffer)
+                       (insert "> \n"))))))
+        (should (claude-emacs-bridge--await-submit buffer)))
+      (should (= resends 2)))))
+
+(ert-deftest claude-emacs-bridge--await-submit-test/gives-up-after-max-resends ()
+  "Resending is bounded so a stuck coordinator is not flooded."
+  (with-temp-buffer
+    (insert "> [5 lines pasted]\n")
+    (let ((resends 0)
+          (claude-emacs-bridge-submit-resend-interval 0.02)
+          (claude-emacs-bridge-submit-poll-interval 0.01)
+          (claude-emacs-bridge-submit-max-resends 3))
+      (cl-letf (((symbol-function 'vterm-send-return)
+                 (lambda () (setq resends (1+ resends)))))
+        (should-not (claude-emacs-bridge--await-submit (current-buffer))))
+      (should (= resends 3)))))
+
+(ert-deftest claude-emacs-bridge-send-test/resends-return-when-paste-is-not-submitted ()
+  "A send whose carriage return is swallowed resends it and still reports success."
+  (let* ((claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-resend-test*"))
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-resend-log-test*"))
+         (claude-emacs-bridge-submit-resend-interval 0.05)
+         (claude-emacs-bridge-submit-poll-interval 0.01)
+         (coordinator
+          (generate-new-buffer claude-emacs-bridge-buffer-name))
+         (returns 0)
+         (reported-message nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer coordinator
+            (setq-local claude-emacs-bridge--coordinator-p t))
+          (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                     (lambda () '((name . "task-1") (pid . 1))))
+                    ((symbol-function 'derived-mode-p) (lambda (&rest _) t))
+                    ((symbol-function 'vterm-check-proc) (lambda (&optional _) t))
+                    ((symbol-function 'vterm-send-string)
+                     (lambda (_string &optional _paste-p)
+                       ;; Claude Code collapses the paste but does not submit it.
+                       (with-current-buffer coordinator
+                         (erase-buffer)
+                         (insert "> [5 lines pasted]\n"))))
+                    ((symbol-function 'vterm-send-return)
+                     (lambda ()
+                       (setq returns (1+ returns))
+                       (when (= returns 2)
+                         (with-current-buffer coordinator
+                           (erase-buffer)
+                           (insert "> \n")))))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (setq reported-message
+                             (apply #'format format-string args)))))
+            (with-temp-buffer
+              (setq buffer-file-name "/tmp/example.go")
+              (insert "one\ntwo\n")
+              (set-buffer-modified-p nil)
+              (claude-emacs-bridge-send (point-min) (point-min) "Look here.")))
+          (should (= returns 2))
+          (should
+           (equal reported-message
+                  "Sent to task-1: /tmp/example.go lines 1-1"))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should-not (string-match-p "may not have been submitted"
+                                        (buffer-string)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name))
+      (kill-buffer coordinator))))
+
+(ert-deftest claude-emacs-bridge-send-test/logs-status-when-submit-never-lands ()
+  "A send that never submits logs the failure instead of reporting success."
+  (let* ((claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-stuck-test*"))
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-stuck-log-test*"))
+         (claude-emacs-bridge-submit-resend-interval 0.02)
+         (claude-emacs-bridge-submit-poll-interval 0.01)
+         (coordinator
+          (generate-new-buffer claude-emacs-bridge-buffer-name))
+         (reported-message nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer coordinator
+            (setq-local claude-emacs-bridge--coordinator-p t)
+            (insert "> [5 lines pasted]\n"))
+          (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                     (lambda () '((name . "task-1") (pid . 1))))
+                    ((symbol-function 'derived-mode-p) (lambda (&rest _) t))
+                    ((symbol-function 'vterm-check-proc) (lambda (&optional _) t))
+                    ((symbol-function 'vterm-send-string)
+                     (lambda (_string &optional _paste-p) nil))
+                    ((symbol-function 'vterm-send-return) (lambda () nil))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (setq reported-message
+                             (apply #'format format-string args)))))
+            (with-temp-buffer
+              (setq buffer-file-name "/tmp/example.go")
+              (insert "one\ntwo\n")
+              (set-buffer-modified-p nil)
+              (claude-emacs-bridge-send (point-min) (point-min) "Look here.")))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should (string-match-p "may not have been submitted"
+                                    (buffer-string))))
+          (should (string-match-p "may not have been submitted"
+                                  reported-message)))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name))
+      (kill-buffer coordinator))))
+
 (provide 'claude-emacs-bridge-tests)
 ;;; claude-emacs-bridge-tests.el ends here
