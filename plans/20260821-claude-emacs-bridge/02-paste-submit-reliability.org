@@ -172,7 +172,13 @@ those means Emacs has to bind its own socket in the same directory.
 Today the coordinator at least says out loud when it could not deliver. The
 socket path gives up that feedback unless the receipt socket is built too.
 
-** Open question, and it decides everything
+** Answered: an external process can deliver
+
+The spike is done and the approach is viable. See
+[[file:./04-inbox-socket-delivery.org][Inbox Socket Delivery]] for what it found
+and what is still unsettled.
+
+** The original open question
 
 The frame format was probed from a process running inside a session, so
 ancestry checks passed. A real Emacs process is outside the session tree and

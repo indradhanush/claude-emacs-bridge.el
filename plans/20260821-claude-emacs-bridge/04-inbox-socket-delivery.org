@@ -1,0 +1,105 @@
+:PROPERTIES:
+:STATUS: DRAFT
+:STATUS_UPDATED_ON: 2026-08-24 17:30
+:END:
+#+title: Inbox Socket Delivery
+#+date: 2026-08-24
+
+* Objective
+
+Replace the coordinator relay with a direct write to the target session's inbox
+socket. Today Emacs types into a terminal, a Haiku session reads what it typed,
+and that session decides where to forward it. Every bug found so far lives in
+one of those hops. Posting to the socket removes both.
+
+The spike that gated this work is done. The approach is viable.
+
+* Spike Results
+
+The open question was whether a process outside any Claude session can deliver
+at all. It has no ancestry to prove and no token to present, so it might be held
+for approval instead.
+
+Conditions were right for the test. Emacs has no =CLAUDE_CODE_MESSAGING_TOKEN=,
+no session environment, and its parent is PID 1, so it is definitively outside
+every session tree. Frames were written from Emacs itself with
+=make-network-process=, which is exactly how the real package would do it.
+
+** It works
+
+A default-mode session received the frame and started a turn on it. The frame
+was the minimal form, with no auth line:
+
+#+begin_example
+{"type":"user","message":{"content":"..."}}\n
+#+end_example
+
+** The receiver identifies the sender by PID
+
+A held message was reported on the receiving side as coming
+=from an unidentified session [verified pid 39911]=, which is the Emacs process.
+So the absence of a token does not make the sender anonymous.
+
+** Holding is real, and the sender cannot see it
+
+A session with =crossSessionInbound= set to =hold= did not act on the message.
+It told its own user clearly, naming the setting and the remedy. Emacs was told
+nothing.
+
+Every outcome looks the same from the sending side:
+
+- delivered :: socket closes, zero bytes back
+- held :: socket closes, zero bytes back
+- malformed frame :: socket closes, zero bytes back
+- socket missing :: connection fails, and this is the one case Emacs can detect
+
+* What This Buys
+
+- The paste, the carriage return, and the terminal all disappear. The submit
+  race in [[file:./02-paste-submit-reliability.org][Paste Submit Reliability]]
+  cannot happen.
+- The at-mention expansion in
+  [[file:./03-relay-must-not-read-files.org][Relay Must Not Read Files]] cannot
+  happen either, because nothing is typed into an input box. Both guards there
+  become unnecessary rather than merely sufficient.
+- Delivery is addressed by PID, so the relay cannot misroute. It has done so:
+  asked for =byohctl-ci-integration=, it sent to =byohctl-teamcity-integration=.
+- The coordinator session, its startup command, the =DO_NOT_TRACK= workaround,
+  and the start and clear commands all go away.
+
+* What This Costs
+
+Emacs learns only that a live socket accepted some bytes. It cannot tell
+delivered from held from malformed. Today the coordinator at least says out loud
+when it could not deliver, even if Emacs never sees it.
+
+There is a documented way to close this. The receiver sends status out of band:
+it opens a fresh connection to whatever address the =from= field names and
+writes a =peer_message_status= control frame, with =status= one of =held=,
+=denied=, =expired=, =delivered=, =refused=, or =dropped=. To receive those,
+Emacs has to bind its own socket inside the same directory and pass its address
+as =uds:<escaped-path>=. That code path has been read but never executed.
+
+* Open Questions
+
+- Whether a target running in =bypassPermissions= mode holds the message. The
+  docs suggest it does by default. Untested: starting such a session requires
+  accepting an interactive security confirmation, which was not done without
+  asking. The =hold= test above stands in for what that failure looks like.
+- Whether binding a receipt socket actually delivers status frames. This decides
+  whether a send can be confirmed rather than merely attempted.
+- Whether target discovery should switch from =claude agents --json= to reading
+  =~/.claude/sessions/*.json=. The registry is what carries
+  =messagingSocketPath=, so it answers reachability directly instead of by proxy
+  through =kind=.
+
+* Next Steps
+
+- [ ] Spike the receipt socket. Bind one, pass =uds:<path>= as =from=, send to a
+  held target and a live one, and see which status frames arrive. This decides
+  whether the redesign can report failures.
+- [ ] Decide on discovery: registry files or the CLI listing.
+- [ ] Only then write the implementation plan.
+- Context: viability is settled. What is unsettled is whether a send can be
+  confirmed, and that is worth knowing before any code is written, because
+  silent delivery failure is the bug this whole redesign exists to remove.
