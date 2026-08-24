@@ -1,0 +1,705 @@
+:PROPERTIES:
+:STATUS: DRAFT
+:STATUS_UPDATED_ON: 2026-08-24 17:52
+:END:
+#+title: Socket Send Path
+#+date: 2026-08-24
+
+* Objective
+
+Add a second send path that writes the message straight to the target session's
+inbox socket. The terminal and the relay session both drop out of it.
+
+[[file:./04-inbox-socket-delivery.org][Inbox Socket Delivery]] settled the
+mechanism. Everything here builds on facts recorded there and does not re-open
+them.
+
+The relay stays the default. The socket path goes in behind an option that is
+off unless asked for. The default only flips once the socket path has carried
+real traffic. Nothing in the relay path is deleted by this work; the Cleanup
+list in plan 04 stays untouched.
+
+* Architecture
+
+Both paths live side by side. One option picks between them, and the split
+happens once, early in the send.
+
+#+begin_example
+                        claude-emacs-bridge-send
+                                    │
+                                    ▼
+                ┌───────────────────────────────────┐
+                │ claude-emacs-bridge-transport     │
+                │ 'relay (default)   |   'socket    │
+                └───────┬───────────────────┬───────┘
+     relay path         │                   │        socket path
+                        ▼                   ▼
+    ┌───────────────────────────┐  ┌───────────────────────────┐
+    │ format-prompt             │  │ registry discovery        │
+    │ BEGIN/END markers         │  │ ~/.claude/sessions/*.json │
+    │ @mention escaping         │  │ messagingSocketPath       │
+    └─────────────┬─────────────┘  └─────────────┬─────────────┘
+                  ▼                              ▼
+    ┌───────────────────────────┐  ┌───────────────────────────┐
+    │ vterm coordinator         │  │ bind receipt socket       │
+    │ *claude-emacs-server*     │  │ /tmp/cc-socks/receipt     │
+    │ paste + RET + resend      │  │ from: uds:<path>          │
+    └─────────────┬─────────────┘  └─────────────┬─────────────┘
+                  ▼                              ▼
+    ┌───────────────────────────┐  ┌───────────────────────────┐
+    │ coordinator model         │  │ write one JSON line       │
+    │ calls SendMessage         │  │ /tmp/cc-socks/<pid>.sock  │
+    └─────────────┬─────────────┘  └─────────────┬─────────────┘
+                  │                              │
+                  └──────────────┬───────────────┘
+                                 ▼
+                   ┌───────────────────────────┐
+                   │ target Claude session     │
+                   │ inbox socket + queue      │
+                   └─────────────┬─────────────┘
+                                 │
+              writes enqueue line│    connects back on failure
+                                 ▼
+                   ┌───────────────────────────┐
+                   │ transcript .jsonl         │
+                   │ receipt socket frame      │
+                   └───────────────────────────┘
+#+end_example
+
+The relay column is exactly what ships today. The socket column is new. Only
+the top box is shared.
+
+Both columns also write to the log buffer. That side channel is left out of the
+diagram to keep it readable and is described in
+[[*Seeing What Happened][Seeing What Happened]].
+
+* Choosing A Path
+
+One option, read once per send.
+
+- =claude-emacs-bridge-transport= :: a =choice= of =relay= or =socket=,
+  defaulting to =relay=.
+
+=claude-emacs-bridge-send= keeps its interactive form, its argument checks and
+its line-range work. After that it branches:
+
+- =claude-emacs-bridge--send-via-relay= :: the current body, moved across
+  unchanged. It still resolves the coordinator buffer, calls
+  =--format-prompt=, pastes, and waits on =--await-submit=.
+- =claude-emacs-bridge--send-via-socket= :: the new path.
+
+The branch sits above target resolution, because the two paths resolve targets
+from different sources. The relay path keeps =claude agents --json=. The socket
+path reads the registry.
+
+Nothing else in the relay path moves. A reviewer should be able to see that the
+extracted function is a copy.
+
+* Finding A Target
+
+Discovery reads =~/.claude/sessions/*.json=. This is forced, not preferred. The
+transcript path needs =sessionId= and =cwd=, and the idle subscription needs
+=peerFeatures=. Only the registry carries them.
+
+- =claude-emacs-bridge-registry-directory= :: option, defaulting to
+  =~/.claude/sessions/=.
+- =claude-emacs-bridge--registry-sessions= :: read every =*.json= in that
+  directory, parse each into an alist the same way =--discover-sessions= does,
+  and keep the usable rows.
+
+A row is kept when all of these hold:
+
+- =messagingSocketPath= is a non-empty string and that file exists.
+- =name= is a non-empty string.
+- =pid= is an integer.
+- =sessionId= and =cwd= are strings.
+- =pid= is not the coordinator's pid.
+
+=messagingSocketPath= is the registry's version of the =kind= test the relay
+path uses. Plan 01 records why that test exists: background agents carry a name
+and sometimes a live pid, but bind no inbox socket, so a message to one goes
+nowhere quietly. A row without a socket path cannot be delivered to, so it is
+dropped for the same reason.
+
+Requiring the socket file to exist also drops rows left behind by sessions that
+have died. It is not a full liveness test. A row that survives the filter and
+then fails to connect is the one failure the sender can detect, per plan 04, so
+that case reports a real error rather than a silent success.
+
+The coordinator is still excluded while the relay exists. It is a normal
+interactive session with its own registry row, and offering it as a target
+would be confusing.
+
+Two things are reused as they are:
+
+- =claude-emacs-bridge--session-label= reads =name=, =pid=, =status= and =cwd=.
+  The registry rows carry all four.
+- The remembered-target hash keyed on =(pid . startedAt)= works unchanged. The
+  registry carries =startedAt=.
+
+So =--read-session= and =--resolve-target= need one change only: where the
+session list comes from. Give =--resolve-target= a session-list argument
+instead of calling =--discover-sessions= itself.
+
+* Building The Frame
+
+Two builders, each pure and each tested on its own.
+
+** The content
+
+=claude-emacs-bridge--socket-content= returns the text the target receives:
+
+#+begin_example
+File: /abs/path.el
+Lines: 12-40
+Instruction: <the typed instruction>
+#+end_example
+
+Nothing wraps it. No relay preamble, no markers, no instruction to a model
+about what not to do.
+
+** The frame
+
+=claude-emacs-bridge--socket-frame= returns one JSON object plus a newline:
+
+- =type= :: ="user"=
+- =msgV= :: =1=
+- =msg_id= :: a fresh UUID
+- =from= :: ="uds:"= followed by the percent-encoded receipt socket path
+- =message= :: an object whose =content= is the content string
+
+=claude-emacs-bridge--uuid= generates the =msg_id=. Emacs has no built-in UUID
+function that is free of a heavy dependency, so this is a small helper over
+random bytes producing an RFC 4122 version 4 string. Its test asserts the shape
+and that two calls differ.
+
+** The write
+
+=claude-emacs-bridge--write-frame= opens the target socket with
+=make-network-process= using =:family 'local= and the socket path as
+=:service=, writes the frame, and closes. A =file-error= here is the missing
+socket case and is reported as a real failure with the path in the message.
+
+* The Receipt Socket
+
+*This section is unresolved and needs Dhanush's call.* Plan 04 lists it as an
+open question and nothing since has settled it.
+
+The receipt socket is how a failure reaches Emacs. The target opens a fresh
+connection to the address in =from= and writes one frame. Plan 04 verified that
+the receiver vets the namespace and not the filename, so the socket must live
+inside =/tmp/cc-socks/= but may be named freely.
+
+Frames that arrive there:
+
+- =peer_message_status= with a =status= of =held= or =expired= and a =reason=
+  written for a human to read.
+- =dropped= with a =drop_reason=, correlated by =orig_msg_id=.
+
+** What owns its lifetime?
+
+*** Option A: one socket per send
+
+Bind before writing, unlink after the confirmation wait.
+
+- Simple to reason about. The socket exists only while a send is in flight.
+- A crashed Emacs leaves one file per in-flight send.
+- It misses the batched drop frame. Plan 04 records that further drops in a
+  sixty-second window arrive about five seconds later in one frame. The socket
+  is long gone by then, so those drops are lost.
+
+*** Option B: one socket per Emacs process
+
+Bind lazily on the first socket send. Keep it for the life of the Emacs
+process. Name it from the Emacs pid, inside =/tmp/cc-socks/=. Correlate frames
+to sends by =msg_id=, which every frame echoes as =orig_msg_id=.
+
+- The batched drop frame still finds a listener. It arrives after the send has
+  already reported, so it is logged and shown as a late message rather than
+  being dropped on the floor.
+- Litter is bounded to one file per Emacs pid.
+- A stale file from a crashed Emacs is easy to handle. The name carries a pid,
+  so a file at our own path was left by a dead process and can be unlinked
+  before binding. Unlink on =kill-emacs-hook= for the normal exit.
+- Cost: a listening socket sits in a shared directory for the whole Emacs
+  session. It only ever receives. The handler ignores anything it cannot parse
+  and anything whose =orig_msg_id= it does not recognise.
+
+*** Option C: no receipt socket
+
+Confirm from the transcript alone.
+
+- Ruled out. A send has to be able to report the recipient's own reason string,
+  and that only arrives on the receipt socket.
+
+** Recommendation
+
+Option B. The deciding fact is the batched drop frame. A per-send socket cannot
+receive it at all, and duplicate drops are the failure most likely to happen in
+normal use. Everything else is a wash, and the stale-file problem is easier
+with a pid-derived name than with a name per send.
+
+There is a second argument for B that carries as much weight. A frame that
+arrives after the send returned is the only record of what went wrong, and
+recording it is what replaces reading the coordinator's screen after the fact.
+A per-send socket is not merely lossy there. It makes that class of failure
+unobservable. See [[*Late frames][Late frames]].
+
+The trade is a socket that outlives the send. That is acceptable because it is
+receive-only and because a name derived from the Emacs pid can never collide
+with a live process other than this one.
+
+* Confirming Delivery
+
+The success signal is the =queue-operation= / =enqueue= line the target writes
+to its own transcript. Its presence means the message cleared the accept gate
+and the duplicate, rate and queue guards.
+
+Helpers, each with its own test:
+
+- =--transcript-slug= :: the session's =cwd= with every character outside
+  =[A-Za-z0-9]= replaced by a dash. Pure.
+- =--transcript-path= :: =~/.claude/projects/<slug>/<sessionId>.jsonl=. When
+  that file is absent, glob =~/.claude/projects/*/<sessionId>.jsonl= and take
+  the first hit. Returns nil when neither resolves.
+- =--transcript-offset= :: the file's size before the send, or 0 when the file
+  does not exist yet.
+- =--enqueue-line-p= :: given one line and the expected content, return non-nil
+  when the line is a =queue-operation= with =operation= of =enqueue= whose
+  =content= matches exactly. Pure. The record carries no =msg_id=, so exact
+  content is the only correlation available.
+- =--await-enqueue= :: read from the noted offset to end of file, scan complete
+  lines, and poll until the deadline.
+
+Reading from a noted offset keeps an older identical send in the same
+transcript from being mistaken for this one. It is the same idea as the
+=--paste-tail-window= that already guards the relay path.
+
+Numbers, both from plan 04:
+
+- The wait is 500 ms.
+- The poll interval is a new option, matching the existing
+  =claude-emacs-bridge-submit-poll-interval= default of 0.05 seconds.
+
+Absence is not failure. Plan 04 lists reasons the line can be missing that have
+nothing to do with delivery: transcript persistence off, history suppressed, or
+a session too new to have a file. So absence means unconfirmed.
+
+* Reporting The Outcome
+
+A send reports exactly one of three things.
+
+1. *Failed.* A =peer_message_status= or =dropped= frame arrived for this
+   =msg_id=. Report the recipient's own =reason= or =drop_reason= verbatim.
+   The bridge does not paraphrase it.
+2. *Delivered.* The enqueue line was found.
+3. *Sent but unconfirmed.* Neither happened before the deadline. Say so
+   plainly. Do not dress it as either of the other two.
+
+The receipt frame is checked first because it carries a reason. In practice the
+two cannot both be true: a held or dropped message is never queued, so no
+enqueue line exists for it.
+
+Every outcome is written to the log buffer through the existing
+=--log-status=, as well as being shown in the echo area.
+
+** The duplicate drop
+
+Identical content from the same sender within thirty seconds is dropped and
+never delivered. Repeating an instruction about the same lines is an ordinary
+thing to do, so this will happen.
+
+A =dropped= frame with a =drop_reason= of =duplicate= is reported as a failure,
+in words that say the target already had this exact text recently and did not
+receive it again. It must not read as success, and it must not read as a bridge
+bug either, because it is neither.
+
+Plan 04 notes the relay path has the same guard behind it and no way to notice.
+Making this visible is one of the things the socket path buys.
+
+* The Message Format
+
+The socket content is the three lines above. What the relay adds is not carried
+over:
+
+- No relay wrapper telling a model to forward something.
+- No =BEGIN TARGET MESSAGE= or =END TARGET MESSAGE= markers.
+- No instruction telling a model not to act on what it forwards.
+- No target =@<name>= mention, because delivery is addressed by socket path.
+
+The at-mention escaping in =--escape-mentions= exists only because text is
+typed into an input box, where Claude Code expands =@path= into an attached
+file before the model runs. Nothing is typed on the socket path, so it is not
+needed there. It stays in the package because the relay path still calls it,
+and the relay path is still the default. Removing it is on plan 04's Cleanup
+list, not here.
+
+=--format-prompt= is likewise untouched.
+
+A test asserts that an =@path= inside an instruction reaches the socket content
+unescaped, so the two paths cannot quietly converge.
+
+* Seeing What Happened
+
+The vterm is a debugging tool as much as a transport. Every bug fixed in this
+package so far was found by reading the coordinator's screen: a carriage return
+that was swallowed, a relay that sent to a wrong similarly-named session, and a
+file that was read from an at-mention. In all three cases a human looked at a
+terminal and saw it.
+
+The socket path has no screen. So it has to carry its own record, and that
+record has to be enough to diagnose a failure nobody has seen yet. Reporting the
+three known outcomes is not enough for that. If the socket path hits something
+shaped like the carriage-return bug, the log is all there will be.
+
+** One log, not two
+
+The package already has a log buffer, named by
+=claude-emacs-bridge-log-buffer-name= and written by =--log-message= and
+=--log-status=. It records target, file, lines and instruction, and nothing
+else.
+
+The socket path extends that log. It does not add a second one. Two formats in
+one buffer defeats searching it, and while the relay is still the default the
+two paths have to be comparable. A bug seen on one path should be describable
+in the same words on the other, so the relay path comes up to the same standard
+in the same change.
+
+The primitive becomes =claude-emacs-bridge--log-event=, taking an event name and
+a list of fields. =--log-message= and =--log-status= are rewritten to call it.
+That changes the text those two produce, which two existing tests assert. See
+[[*Open Questions][Open Questions]].
+
+** Every send gets an id
+
+The socket path already mints a UUID for =msg_id=. The relay path has no such
+handle: =SendMessage= generates its own id inside the coordinator and Emacs
+never sees it.
+
+So Emacs mints one id per send on both paths, purely for correlation. On the
+socket path it is the same value that goes out as =msg_id=. On the relay path
+it is local to the log. Both paths then produce entries that can be searched for
+the same way, and the =--uuid= helper serves both.
+
+** What a send records
+
+One entry when the send goes out:
+
+- Timestamp.
+- Transport, =relay= or =socket=.
+- The send id.
+- Target name and pid.
+- Target socket path, on the socket path only.
+- The content actually sent. On the socket path that is the three lines. On the
+  relay path it is the whole prompt, wrapper and escaping included.
+
+Recording what was actually sent matters more than recording what was meant. The
+at-mention bug in
+[[file:./03-relay-must-not-read-files.org][Relay Must Not Read Files]] was
+exactly a gap between the two, and it was visible on the coordinator's screen
+because the screen showed the bytes that arrived rather than the ones intended.
+
+One further entry when the outcome is known, carrying the same send id and one
+of delivered, failed with the reason, or unconfirmed.
+
+** The raw frame
+
+=claude-emacs-bridge-log-frames= is an option. When it is on, the exact bytes
+handed to =process-send-string= are logged verbatim alongside the send entry.
+
+This is the record wanted when the bug is that the wrong bytes went out. A
+rendered summary of the frame cannot show a field that was serialised wrongly,
+a missing newline, or an encoding problem, because the summary is built from the
+same values the frame was.
+
+Recommendation: on by default while the socket path is opt-in. Someone who has
+turned the transport on is testing it, and that is the moment the frame is worth
+having. Revisit when the socket path becomes the default.
+
+The frame contains the file path and the instruction. Both are already in the
+log, so this adds no exposure the log buffer did not have.
+
+** Late frames
+
+This is the hard part and the most important one.
+
+Plan 04 records that the first drop in a sixty-second window is reported
+immediately and further drops are batched, arriving about five seconds later in
+one frame naming them in =dropped_msg_ids=. The confirmation wait is 500 ms. So
+a send can report unconfirmed and the real explanation can arrive afterwards.
+
+Reading the coordinator's screen a minute later is what used to cover this. The
+log has to do the same job.
+
+- The receipt socket stays bound after the send returns, so a late frame has
+  somewhere to land. This is the argument for Option B above.
+- =claude-emacs-bridge--sends= holds a record per send id: send time, transport,
+  target name and pid, file, lines and content. A late frame is joined back to
+  it, so the log entry names the file and lines the frame is about rather than
+  only a UUID.
+- A record is retained until it is older than the sixty-second window plan 04
+  names for drop reporting. Nothing that arrives is expected after that.
+- A late frame is logged as its own entry, marked late, carrying the same send
+  id and the frame's reason. It is also shown once in the echo area, because a
+  send that already reported unconfirmed has no other way to correct itself.
+- A frame whose =orig_msg_id= matches no record is still logged, verbatim, and
+  marked uncorrelated. An unknown frame is a symptom. Discarding it throws away
+  the evidence for the failure nobody has seen yet.
+- If an idle subscription is ever added, =peer_idle_notice= is handled the same
+  way. It is out of scope here, and this is the shape it would take.
+
+** Failures that produce no frame
+
+These are the cases where nothing arrives at all and a user is left with
+nothing, so the log entry is the only artifact. Each is logged with the facts
+that were resolved before the failure, not just a message.
+
+- Connect refused or socket file missing. Log the socket path, the target name
+  and pid, and the error. Plan 04 notes this is the one failure the sender can
+  detect on the connection itself.
+- Registry entry unusable. Log which field was missing or which file was gone.
+  A stale row is what a wrong-target bug would look like.
+- Transcript file not found by either the direct path or the glob. Log both
+  paths that were tried, the slug and the =sessionId=. This is unconfirmed and
+  not failure, and the log has to make that distinction legible.
+- Transcript found but unreadable, or holding no matching line by the deadline.
+  Log the offset it read from and the byte count it scanned.
+
+** Should the log go to a file?
+
+A buffer dies with Emacs. "It was working yesterday" is a real situation and a
+buffer cannot answer it.
+
+Adding a file sink is cheap. The formatting work is already done by
+=--log-event=, so the sink is one append per entry to a path named by an option,
+and nil turns it off. That is small enough to keep in scope.
+
+Recommendation: add it, with a default path under the user's Emacs directory.
+The cost is that the instruction text and file paths now persist on disk, where
+before they died with the session. That is the same content the log buffer
+already holds, so it is a change in lifetime rather than in what is exposed, and
+turning the option off restores the old behaviour exactly.
+
+Rotation is not designed here. See [[*Open Questions][Open Questions]].
+
+** How someone reads it
+
+=claude-emacs-bridge-show-log= is a new command that pops to the log buffer.
+There is no such command today; the buffer only appears as a side effect of a
+send.
+
+The format is one line per event. Fields are =key=value=, after a timestamp and
+the event name. Any multi-line payload, meaning the content and the raw frame,
+is written as a quoted string on that same line.
+
+The trade-off, stated rather than assumed:
+
+- One-liners are searchable. Pulling every entry for one send id is a single
+  search, and that is the operation a late frame forces. This is the deciding
+  reason.
+- Human-readable blocks, which is what the log does today, are nicer to read a
+  single entry in and worse at every other task. Correlating two entries means
+  scrolling.
+- Fully structured JSON per line would be parseable later, but nothing is
+  parsing it and the buffer is read by a person. It costs readability now for a
+  consumer that does not exist.
+
+So: one line per event, quoted payloads, readable without tooling and
+searchable with =occur=. If a parser is ever wanted, the field syntax is regular
+enough to be one.
+
+* Tasks
+
+Each slice leaves the package working. The socket path is unreachable until the
+user sets the option, so an unfinished slice cannot break a real send.
+
+** TODO Add the transport option and the branch
+Add =claude-emacs-bridge-transport=, defaulting to =relay=. Extract the current
+send body into =--send-via-relay= without changing it. Add
+=--send-via-socket= as a stub that signals an error saying it is not
+implemented. Test that each option value calls the matching function.
+
+** TODO Build the log
+Add =--log-event=, the send id, =claude-emacs-bridge-log-frames=, the file sink
+option and =claude-emacs-bridge-show-log=. Rewrite =--log-message= and
+=--log-status= to call =--log-event=, and update the two tests that assert their
+old text. Have the relay path record a send entry and an outcome entry.
+
+This lands second on purpose. Every slice after it is easier to debug because
+it exists, and the relay path gets the benefit immediately even though the
+socket path is still a stub.
+
+Test the field formatting, the quoting of a multi-line payload, that
+=--log-frames= off omits the frame, that the file sink writes when a path is set
+and does nothing when it is nil, and that the show command pops the buffer.
+
+** TODO Read targets from the session registry
+Add =claude-emacs-bridge-registry-directory= and
+=--registry-sessions=. Give =--resolve-target= a session-list argument. Test
+the filter against fixture JSON files in a temp directory, covering a row with
+no =messagingSocketPath=, a row whose socket file is gone, the coordinator's
+own row, and a good row.
+
+** TODO Build the message content and the frame
+Add =--socket-content=, =--socket-frame= and =--uuid=. Test the content shape,
+the frame fields, that an =@path= is not escaped, and that two UUIDs differ.
+
+** TODO Bind and read the receipt socket
+Add the receipt socket per the resolved lifetime decision, its address
+formatting, its stale-file handling and its frame parser. Test the parser on
+=held=, =expired= and =dropped= frames, on a frame for an unknown =msg_id=, and
+on unparseable bytes. Test that binding over a stale file at our own path
+succeeds.
+
+Add =--sends= and the late-frame path: a frame arriving after the send returned
+is joined to its record, logged as late, and shown once. Test a late frame
+against a live record, a frame with no matching record logged as uncorrelated,
+and a record dropped once it is older than the sixty-second window.
+
+*Blocked on the receipt socket decision.*
+
+** TODO Write the frame, reporting unconfirmed always
+Add =--write-frame= and have =--send-via-socket= resolve a target, build the
+frame, write it and report sent-but-unconfirmed. Test the write with a fake
+=make-network-process=, and test that a =file-error= is reported as a failure
+naming the socket path. Test that the failure entry carries the socket path, the
+target name and the error, per
+[[*Failures that produce no frame][Failures that produce no frame]].
+
+** TODO Confirm from the transcript
+Add =--transcript-slug=, =--transcript-path=, =--transcript-offset=,
+=--enqueue-line-p= and =--await-enqueue=. Test the slug, both path branches and
+the nil case, the offset for a missing file, exact and near-miss content
+matches, and the await loop finding a line and timing out. Test that an
+unresolved transcript logs both paths it tried and reads as unconfirmed rather
+than failed.
+
+** TODO Select and report the outcome
+Combine the receipt frame and the transcript result into one of the three
+outcomes, log it and show it. Test all three, and test the duplicate drop
+specifically, asserting the reported text does not read as success.
+
+** TODO Add the live throwaway-session test
+Gated so the default batch run does not need Claude installed.
+
+** TODO Update the architecture guide and plan 04
+Add a socket-path section to =CLAUDE.md=. Record in plan 04 that its Next Steps
+are done.
+
+* Testing
+
+The suite currently runs 56 tests and must keep passing untouched. New tests
+add on top. Every helper introduced here gets a direct ERT test, matching the
+convention already in =CLAUDE.md=.
+
+The one exception is the two tests that assert the old =--log-message= and
+=--log-status= text. Those change when the log format changes. Everything else
+stays as it is.
+
+** What fakes cover
+
+Almost all of it. The existing suite fakes collaborators with =cl-letf= over
+=symbol-function= and spawns no processes; the new tests do the same.
+
+- Transport selection, by faking the two send functions.
+- Registry parsing and filtering, from fixture JSON files written into a temp
+  directory.
+- Content, frame, UUID and address formatting. All pure.
+- The socket write, by faking =make-network-process= and
+  =process-send-string=.
+- Receipt frame parsing, by feeding the parser strings.
+- Transcript slug, path resolution, offset, line matching and the await loop,
+  against files written into a temp directory.
+- Outcome selection and its reported text.
+- Log event formatting, payload quoting, the frame option, and the file sink
+  against a temp file.
+- The send record table, late-frame correlation, an uncorrelated frame, and
+  retention.
+
+** What needs a live session
+
+Only the end-to-end claim: that a real session accepts the frame, writes the
+enqueue line, and connects back on failure. Plan 04 verified this by hand. One
+gated test keeps it verified.
+
+The shape:
+
+- Make a scratch directory under =temporary-file-directory=.
+- Start =claude= in it with a random name of the form
+  =emacs-bridge-test-<random>=, as a subprocess the test owns.
+- Poll the registry until a row appears whose =name= is that exact random name
+  and which carries a =messagingSocketPath=.
+- Send to that row's socket, confirm, then kill the process and delete the
+  scratch directory.
+
+** How the live test stays isolated
+
+- It only ever writes to the socket named in the row whose =name= matches the
+  random name it generated. It does not use the picker and does not choose from
+  a list.
+- The name is random per run, so it cannot match a session someone is using.
+- Its =cwd= is a fresh scratch directory, so its transcript is its own.
+- It runs only when an environment variable asks for it. The default batch run
+  stays offline and needs no Claude install, which is what
+  =emacs -Q --batch= currently relies on.
+- It never reads or writes the coordinator, and never starts a vterm.
+
+* Decisions
+
+- 2026-08-24 :: The relay stays the default. The socket path is opt-in until it
+  has carried real traffic. A working setup is not swapped for an untested one.
+- 2026-08-24 :: Nothing in the relay path is deleted here. Plan 04's Cleanup
+  list is for later.
+- 2026-08-24 :: Discovery reads the session registry. The transcript path and
+  the idle subscription both need fields only the registry carries.
+- 2026-08-24 :: The registry equivalent of the =kind= filter is the presence of
+  =messagingSocketPath=. Same reason as plan 01: a target with no inbox socket
+  cannot be delivered to.
+- 2026-08-24 :: Confirmation waits 500 ms, per plan 04.
+- 2026-08-24 :: A send reports delivered, failed with the recipient's own
+  reason, or sent-but-unconfirmed. Nothing else.
+- 2026-08-24 :: The socket path does not escape at-mentions. The escaping stays
+  in the package for the relay.
+- 2026-08-24 :: One log serves both paths. The existing log buffer is extended
+  rather than a second one added.
+- 2026-08-24 :: Every send gets an id on both paths. On the socket path it is
+  the =msg_id=.
+- 2026-08-24 :: The log is one searchable line per event. Correlating a late
+  frame to its send is the operation that decides the format.
+- 2026-08-24 :: The log also goes to a file, behind an option, because a buffer
+  cannot answer "it was working yesterday".
+
+* Open Questions
+
+- What owns the receipt socket's lifetime. Option B, one socket per Emacs
+  process, is the recommendation above, on the strength of the batched drop
+  frame. Needs Dhanush's call before that task starts.
+- The exact percent-encoding used in the =from= address. Plan 04 records that a
+  percent-encoded socket path was accepted live. The escaping set that spike
+  used should be confirmed against its transcript before the frame builder is
+  written, rather than assumed to match =url-hexify-string=.
+- Whether the socket path should subscribe to =notify_when_idle=. Plan 04
+  documents the mechanism and its sharp edge, but nothing in the three outcomes
+  needs it. Left out of this plan on purpose.
+- Whether rewriting =--log-message= and =--log-status= is acceptable. It changes
+  the text of a shipped function and two existing tests assert that text. The
+  alternative is to keep both producing their current output and add
+  =--log-event= alongside, which leaves two formats in one buffer and makes it
+  unsearchable. The recommendation is the rewrite. Needs Dhanush's call, because
+  it is the only place this plan changes an existing test.
+- Whether the log file needs rotation, and on what trigger. Nothing in plan 04
+  or the code gives a size or an age to base one on, so no threshold is proposed
+  here rather than inventing one.
+- Whether the raw frame should stay logged by default once the socket path
+  becomes the default transport. It is recommended on while the transport is
+  opt-in, and that reason expires when the default flips.
+- Carried over from plan 04, unchanged: whether a =bypassPermissions= target
+  holds the message, and whether the relay path has been silently hitting the
+  duplicate guard all along.
+
+* Next Steps
+
+- [ ] Settle the receipt socket's lifetime.
+- [ ] Confirm the =from= address encoding against the spike transcript.
+- [ ] Decide whether =--log-message= and =--log-status= may be rewritten.
+- [ ] Start on the transport option and the branch, then the log.
