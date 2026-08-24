@@ -115,7 +115,10 @@ being mistaken for input that is still waiting to be sent.")
    (user-error "Cannot determine a project, workspace, Git root, or directory")))
 
 (defun claude-emacs-bridge--discover-sessions (&optional coordinator-pid)
-  "Return active, named Claude sessions other than COORDINATOR-PID."
+  "Return reachable, named Claude sessions other than COORDINATOR-PID.
+Only interactive sessions are returned.  Claude Code also lists background
+agents, which carry a name and sometimes a live PID but have no inbox socket,
+so the coordinator cannot deliver anything to them."
   (let* ((coordinator (get-buffer claude-emacs-bridge-buffer-name))
          (process (and coordinator (get-buffer-process coordinator)))
          (coordinator-pid (or coordinator-pid
@@ -146,8 +149,10 @@ being mistaken for input that is still waiting to be sent.")
           (cl-remove-if-not
            (lambda (session)
              (let ((pid (alist-get 'pid session))
-                   (name (alist-get 'name session)))
-               (and (integerp pid)
+                   (name (alist-get 'name session))
+                   (kind (alist-get 'kind session)))
+               (and (equal kind "interactive")
+                    (integerp pid)
                     (stringp name)
                     (not (string-empty-p name))
                     (not (equal pid coordinator-pid)))))

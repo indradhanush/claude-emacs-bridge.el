@@ -82,6 +82,14 @@ is excluded by comparing the JSON `pid` against the vterm subprocess PID.
 Filtering by name is not reliable: Claude Code renames sessions when names
 collide.
 
+Only rows whose `kind` is `interactive` are kept. Interactive sessions are the
+only ones that bind an inbox socket in `/tmp/cc-socks/`, so they are the only
+ones the coordinator can deliver to. The same listing also returns background
+agents, which carry a name and sometimes a live pid, and a pid-and-name test
+cannot tell the two apart. A row that does not say it is interactive is
+dropped, so a change to the listing shape empties the picker instead of
+offering a target that silently goes nowhere.
+
 Each Emacs context gets one remembered target, held in the in-memory
 `claude-emacs-bridge--targets` hash table. Associations do not survive an Emacs
 restart. The context key is the first of these that resolves, as a

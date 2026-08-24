@@ -124,6 +124,37 @@
     (should-error (claude-emacs-bridge--discover-sessions)
                   :type 'user-error)))
 
+(ert-deftest claude-emacs-bridge--discover-sessions-test/excludes-background-agents ()
+  "A background agent is not offered, even with a live PID and a name.
+Background agents have no inbox socket, so the coordinator cannot reach them."
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _)
+               (insert (concat
+                        "[{\"pid\":1,\"cwd\":\"/tmp/one\","
+                        "\"kind\":\"interactive\","
+                        "\"sessionId\":\"11111111-1111-1111-1111-111111111111\","
+                        "\"name\":\"task-1\",\"status\":\"idle\"},"
+                        "{\"pid\":55098,\"cwd\":\"/tmp/two\","
+                        "\"kind\":\"background\","
+                        "\"sessionId\":\"22222222-2222-2222-2222-222222222222\","
+                        "\"name\":\"byohctl-ci-integration\",\"status\":\"idle\"}]"))
+               0)))
+    (let ((sessions (claude-emacs-bridge--discover-sessions)))
+      (should (= (length sessions) 1))
+      (should (equal (alist-get 'name (car sessions)) "task-1")))))
+
+(ert-deftest claude-emacs-bridge--discover-sessions-test/excludes-rows-without-a-kind ()
+  "A row that does not say it is interactive is left out.
+An empty picker is a loud failure; offering an unreachable target is a quiet one."
+  (cl-letf (((symbol-function 'call-process)
+             (lambda (&rest _)
+               (insert (concat
+                        "[{\"pid\":1,\"cwd\":\"/tmp/one\","
+                        "\"sessionId\":\"11111111-1111-1111-1111-111111111111\","
+                        "\"name\":\"task-1\",\"status\":\"idle\"}]"))
+               0)))
+    (should-not (claude-emacs-bridge--discover-sessions))))
+
 (ert-deftest claude-emacs-bridge--session-label-test/includes-disambiguating-pid ()
   "Picker labels contain the name, PID, status, and cwd."
   (should

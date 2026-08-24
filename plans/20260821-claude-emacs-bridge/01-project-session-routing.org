@@ -18,6 +18,7 @@ current Emacs process.
 - [X] Emacs can request and display the active local Claude Code sessions that
   the coordinator can reach.
 - [X] The coordinator session itself is not offered as a target.
+- [X] Background agents are not offered as targets.
 - [X] A project without an association prompts for a target before sending.
 - [X] A project with a live associated target sends without prompting.
 - [X] A stale association is cleared and replaced before another message is
@@ -65,6 +66,16 @@ current Emacs process.
   the vterm subprocess PID. Filtering by its mutable name is not reliable.
 - Claude Code's =ListAgents= and =SendMessage= tools are available to the model,
   not directly to the current Emacs Lisp integration.
+- Only interactive sessions can receive a cross-session message. They are the
+  only ones that bind an inbox socket in =/tmp/cc-socks/= and register a
+  =messagingSocketPath= in =~/.claude/sessions/<pid>.json=. A session's own
+  =ListAgents= lists interactive peers and nothing else.
+- =claude agents --json= lists background agents alongside interactive
+  sessions. Background rows carry a =name=, and some carry a live =pid=: an
+  observed row was =byohctl-ci-integration= at pid 55098, running as
+  =claude bg-spare= under a parent session. Such a row is indistinguishable
+  from a real target on =pid= and =name= alone, so =kind= is the field that
+  decides reachability.
 - Duplicate live session names may require the short address that Claude Code
   supplies during listing.
 - The bridge formats the selected session's live name into each coordinator
@@ -167,6 +178,21 @@ current Emacs process.
 - Verification: 35 ERT tests passed in isolated and running Doom Emacs. Byte
   compilation, Checkdoc, =check-parens=, and =git diff --check= passed.
 
+** DONE Offer only reachable targets
+
+The picker listed anything from =claude agents --json= that had a PID and a
+name. Background agents pass that test but have no inbox, so selecting one sent
+the message into the coordinator and no further. The coordinator reported
+=no agent named 'byohctl-ci-integration' is reachable=, which Emacs never sees,
+so the bridge still called the send a success.
+
+Discovery now keeps only rows whose =kind= is =interactive=. A row that does not
+say it is interactive is dropped, so a future change to the listing shape
+empties the picker rather than quietly offering a target that cannot be reached.
+
+Verified against the live session list: the picker offers exactly the
+socket-backed sessions minus the coordinator.
+
 * Decisions
 
 - [2026-08-21] Keep associations in memory for this proof of concept because
@@ -191,10 +217,18 @@ current Emacs process.
 - [2026-08-21] Keep the package local and load it through Doom's
   =use-package!= rather than introducing package-manager metadata or remote
   installation.
+- [2026-08-24] Filter targets on =kind= rather than on the presence of a PID.
+  A PID says a process exists, not that it can be addressed.
+- [2026-08-24] Prefer an empty picker over an unreachable target. A picker with
+  nothing in it is obvious; a message accepted and never delivered is not.
 
 * Blockers / Open Questions
 
-- None.
+- A send is reported as successful once the coordinator accepts the paste.
+  Delivery happens one hop later, inside the coordinator, and Emacs cannot see
+  whether it worked. Reading that back means parsing prose written by a Haiku
+  session. Posting to the inbox socket would remove the hop entirely; see
+  [[file:./02-paste-submit-reliability.org][Paste Submit Reliability]].
 
 * Rejected Approaches
 
@@ -205,10 +239,14 @@ current Emacs process.
   session.
 - Interactive TUI scraping: fragile; retain only as an explicitly approved
   fallback if supported discovery is unavailable.
+- Treating any named row with a PID as a target: background agents satisfy both
+  and cannot receive anything.
 
 * Next Steps
 
 - [ ] With a disposable second target, verify live stale-target recovery and
   explicit reassignment without disrupting =task-1=.
-- Context: package extraction is complete. The remaining routing follow-up is
-  live stale-target and reassignment verification.
+- [ ] Decide whether a send should confirm delivery, not just acceptance. This
+  is the same argument that favours the socket redesign.
+- Context: targets are now filtered to reachable sessions. The remaining
+  routing follow-up is live stale-target and reassignment verification.
