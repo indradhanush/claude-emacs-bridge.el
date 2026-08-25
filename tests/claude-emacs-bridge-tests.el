@@ -371,41 +371,6 @@ can read is a relay that leaks whatever a path in an instruction points at."
             (should (eq (claude-emacs-bridge--coordinator-buffer) buffer))))
       (kill-buffer buffer))))
 
-(ert-deftest claude-emacs-bridge--log-status-test/appends-status ()
-  "The log records coordinator status messages."
-  (let ((claude-emacs-bridge-log-buffer-name
-         (generate-new-buffer-name "*claude-emacs-bridge-status-log-test*")))
-    (unwind-protect
-        (progn
-          (claude-emacs-bridge--log-status
-           "Claude coordinator is not running.")
-          (with-current-buffer claude-emacs-bridge-log-buffer-name
-            (should
-             (equal (buffer-string)
-                    "Status: Claude coordinator is not running.\n\n"))
-            (should buffer-read-only)))
-      (when (get-buffer claude-emacs-bridge-log-buffer-name)
-        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
-
-(ert-deftest claude-emacs-bridge--log-message-test/appends-message-details ()
-  "The log records the target, file, line range, and message."
-  (let ((claude-emacs-bridge-log-buffer-name
-         (generate-new-buffer-name "*claude-emacs-bridge-log-test*")))
-    (unwind-protect
-        (progn
-          (claude-emacs-bridge--log-message
-           '((name . "task-1")) "/tmp/example.go" 4 7 "Review these lines.")
-          (with-current-buffer claude-emacs-bridge-log-buffer-name
-            (should
-             (equal (buffer-string)
-                    (concat "Target: task-1\n"
-                            "File: /tmp/example.go\n"
-                            "Lines: 4:7\n"
-                            "Message: Review these lines.\n\n")))
-            (should buffer-read-only)))
-      (when (get-buffer claude-emacs-bridge-log-buffer-name)
-        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
-
 (ert-deftest claude-emacs-bridge-start-test/starts-owned-vterm ()
   "Starting the coordinator creates its vterm and launches the fixed command."
   (let* ((claude-emacs-bridge--mode 'relay)
@@ -514,6 +479,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
           "*claude-emacs-bridge-send-test*")
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-send-log-test*"))
+         (claude-emacs-bridge-log-file nil)
          (coordinator
           (generate-new-buffer claude-emacs-bridge-buffer-name))
          (sent-string nil)
@@ -562,12 +528,13 @@ can read is a relay that leaks whatever a path in an instruction points at."
           (should sent-paste-p)
           (should return-sent)
           (with-current-buffer claude-emacs-bridge-log-buffer-name
-            (should
-             (equal (buffer-string)
-                    (concat "Target: task-1\n"
-                            "File: /tmp/example.go\n"
-                            "Lines: 1:2\n"
-                            "Message: Review these lines.\n\n"))))
+            (let ((text (buffer-string)))
+              (should (string-match-p " send .*transport=relay" text))
+              (should (string-match-p "target=task-1" text))
+              (should (string-match-p "file=/tmp/example.go" text))
+              (should (string-match-p "lines=1-2" text))
+              (should (string-match-p "Review these lines\\." text))
+              (should (string-match-p " outcome .*result=submitted" text))))
           (should
            (equal reported-message
                   "Sent to task-1: /tmp/example.go lines 1-2")))
@@ -582,6 +549,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
           (generate-new-buffer-name "*claude-emacs-bridge-missing-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-missing-log-test*"))
+         (claude-emacs-bridge-log-file nil)
          (coordinator (generate-new-buffer " *claude-emacs-bridge-started-test*"))
          (prompt-count 0)
          (start-count 0)
@@ -624,10 +592,10 @@ can read is a relay that leaks whatever a path in an instruction points at."
           (should (string-match-p "Instruction: Review this line\\." sent-string))
           (with-current-buffer claude-emacs-bridge-log-buffer-name
             (should
-             (string-prefix-p
-              "Status: Claude coordinator is not running.\n\n"
+             (string-match-p
+              "status text=\"Claude coordinator is not running\\.\""
               (buffer-string)))
-            (should (string-match-p "Message: Review this line\\."
+            (should (string-match-p "Review this line\\."
                                     (buffer-string)))))
       (when (get-buffer claude-emacs-bridge-log-buffer-name)
         (kill-buffer claude-emacs-bridge-log-buffer-name))
@@ -639,7 +607,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
          (claude-emacs-bridge-buffer-name
          (generate-new-buffer-name "*claude-emacs-bridge-decline-test*"))
         (claude-emacs-bridge-log-buffer-name
-         (generate-new-buffer-name "*claude-emacs-bridge-decline-log-test*")))
+         (generate-new-buffer-name "*claude-emacs-bridge-decline-log-test*"))
+        (claude-emacs-bridge-log-file nil))
     (unwind-protect
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
                   ((symbol-function 'claude-emacs-bridge-start)
@@ -657,8 +626,9 @@ can read is a relay that leaks whatever a path in an instruction points at."
              (claude-emacs-bridge-send 1 2 "Review this line.")))
           (with-current-buffer claude-emacs-bridge-log-buffer-name
             (should
-             (equal (buffer-string)
-                    "Status: Claude coordinator is not running.\n\n"))))
+             (string-match-p
+              "status text=\"Claude coordinator is not running\\.\""
+              (buffer-string)))))
       (when (get-buffer claude-emacs-bridge-log-buffer-name)
         (kill-buffer claude-emacs-bridge-log-buffer-name)))))
 
@@ -701,6 +671,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name
            "*claude-emacs-bridge-current-line-log-test*"))
+         (claude-emacs-bridge-log-file nil)
          (coordinator
           (generate-new-buffer claude-emacs-bridge-buffer-name))
          (sent-string nil)
@@ -887,6 +858,190 @@ can read is a relay that leaks whatever a path in an instruction points at."
            (should (string-match-p "vterm" text))
            (should (string-match-p "claude-emacs-bridge-switch-transport" text))))))))
 
+;;; The log
+
+(ert-deftest claude-emacs-bridge--uuid-test/differs-each-call ()
+  "Send ids are distinct and shaped like a UUID."
+  (let ((a (claude-emacs-bridge--uuid))
+        (b (claude-emacs-bridge--uuid)))
+    (should-not (equal a b))
+    (should (string-match-p
+             "\\`[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-4[0-9a-f]\\{3\\}-[89ab][0-9a-f]\\{3\\}-[0-9a-f]\\{12\\}\\'"
+             a))))
+
+(ert-deftest claude-emacs-bridge--log-event-test/writes-one-searchable-line ()
+  "An event is one line of key=value fields after a timestamp and a name."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-line-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-event 'send :transport 'relay :pid 42)
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (= (length (split-string (string-trim text) "\n")) 1))
+              (should (string-match-p " send " text))
+              (should (string-match-p "transport=relay" text))
+              (should (string-match-p "pid=42" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-event-test/quotes-a-multiline-payload ()
+  "A payload with newlines stays on one line, quoted."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-quote-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-event 'send :content "one\ntwo three")
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (= (length (split-string (string-trim text) "\n")) 1))
+              (should (string-match-p "content=\"one\\\\ntwo three\"" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-event-test/omits-empty-fields ()
+  "A field with no value is left out rather than logged as nothing."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-omit-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-event 'send :transport 'socket :socket nil)
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should-not (string-match-p "socket=" (buffer-string)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-event-test/appends-to-the-file-sink ()
+  "With a log file set, each event is appended to it."
+  (let* ((claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-log-file-test*"))
+         (path (make-temp-file "bridge-log-test"))
+         (claude-emacs-bridge-log-file path))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-event 'send :id "abc")
+          (claude-emacs-bridge--log-event 'outcome :id "abc")
+          (with-temp-buffer
+            (insert-file-contents path)
+            (let ((lines (split-string (string-trim (buffer-string)) "\n")))
+              (should (= (length lines) 2))
+              (should (string-match-p "id=abc" (car lines))))))
+      (delete-file path)
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-event-test/file-sink-off-writes-nothing ()
+  "With no log file set, nothing is written to disk."
+  (let* ((claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-log-nofile-test*"))
+         (claude-emacs-bridge-log-file nil)
+         (wrote nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'write-region)
+                   (lambda (&rest _) (setq wrote t))))
+          (claude-emacs-bridge--log-event 'send :id "abc")
+          (should-not wrote))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-send-test/records-what-was-actually-sent ()
+  "The send entry carries the id, transport, target and the bytes that went out."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-send-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-send
+           "id-1" 'relay '((name . "task-1") (pid . 7))
+           "/tmp/example.go" '(4 . 7) "PROMPT BODY" nil nil)
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (string-match-p "id=id-1" text))
+              (should (string-match-p "transport=relay" text))
+              (should (string-match-p "target=task-1" text))
+              (should (string-match-p "pid=7" text))
+              (should (string-match-p "file=/tmp/example.go" text))
+              (should (string-match-p "lines=4-7" text))
+              (should (string-match-p "content=\"PROMPT BODY\"" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-send-test/frame-option-off-omits-the-frame ()
+  "The raw frame is logged only when the option asks for it."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-frame-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (let ((claude-emacs-bridge-log-frames nil))
+            (claude-emacs-bridge--log-send
+             "id-2" 'socket '((name . "task-1") (pid . 7))
+             "/tmp/a.go" '(1 . 1) "body" "/tmp/cc-socks/7.sock" "{\"type\":\"user\"}"))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (should-not (string-match-p "frame=" (buffer-string)))
+            (let ((inhibit-read-only t)) (erase-buffer)))
+          (let ((claude-emacs-bridge-log-frames t))
+            (claude-emacs-bridge--log-send
+             "id-3" 'socket '((name . "task-1") (pid . 7))
+             "/tmp/a.go" '(1 . 1) "body" "/tmp/cc-socks/7.sock" "{\"type\":\"user\"}"))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (string-match-p "frame=" text))
+              (should (string-match-p "socket=/tmp/cc-socks/7.sock" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-outcome-test/carries-the-send-id-and-result ()
+  "The outcome entry can be found by the same id as its send."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-outcome-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-outcome "id-9" 'unconfirmed "no reply came")
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (string-match-p "id=id-9" text))
+              (should (string-match-p "result=unconfirmed" text))
+              (should (string-match-p "reason=\"no reply came\"" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--log-status-test/is-one-event-line ()
+  "Status entries share the one-line format so the buffer stays searchable."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-log-status-test*"))
+        (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (claude-emacs-bridge--log-status "Coordinator is not running")
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (string-trim (buffer-string))))
+              (should (= (length (split-string text "\n")) 1))
+              (should (string-match-p " status " text))
+              (should (string-match-p "Coordinator is not running" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge-show-log-test/pops-to-the-log ()
+  "The log has a command of its own instead of only appearing after a send."
+  (let ((claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-show-log-test*"))
+        (claude-emacs-bridge-log-file nil)
+        (popped nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer)
+                   (lambda (buffer &rest _) (setq popped buffer) buffer)))
+          (claude-emacs-bridge-show-log)
+          (should (bufferp popped))
+          (should (equal (buffer-name popped)
+                         claude-emacs-bridge-log-buffer-name)))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
 ;;; Paste submission recovery
 
 (ert-deftest claude-emacs-bridge--pending-paste-test/detects-collapsed-paste ()
@@ -981,6 +1136,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
           (generate-new-buffer-name "*claude-emacs-bridge-resend-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-resend-log-test*"))
+         (claude-emacs-bridge-log-file nil)
          (claude-emacs-bridge-submit-resend-interval 0.05)
          (claude-emacs-bridge-submit-poll-interval 0.01)
          (coordinator
@@ -1035,6 +1191,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
           (generate-new-buffer-name "*claude-emacs-bridge-stuck-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-stuck-log-test*"))
+         (claude-emacs-bridge-log-file nil)
          (claude-emacs-bridge-submit-resend-interval 0.02)
          (claude-emacs-bridge-submit-poll-interval 0.01)
          (coordinator

@@ -35,6 +35,26 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-log-frames nil
+  "Whether to log the exact bytes written to a target's socket.
+A rendered summary of a frame is built from the same values the frame was,
+so it cannot show a field serialised wrongly, a missing newline, or an
+encoding fault.  The frame itself can.  Worth keeping on while the socket
+mode is new.  The frame holds the file path and the instruction, both of
+which the log already records."
+  :type 'boolean
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-log-file
+  (expand-file-name "claude-emacs-bridge.log" user-emacs-directory)
+  "File the log is appended to, or nil to keep it in the buffer alone.
+A buffer dies with Emacs and cannot answer \"it was working yesterday\".
+This is the same content the log buffer already holds, so setting it
+changes how long that content lives rather than what is exposed.  Setting
+it to nil restores the buffer-only behaviour exactly."
+  :type '(choice (const :tag "Buffer only" nil) file)
+  :group 'claude-emacs-bridge)
+
 (defcustom claude-emacs-bridge-preferred-transport nil
   "The remembered delivery mode, `relay', `socket', or nil.
 This is what survives a restart.  It is nil until the first send asks, and
@@ -367,36 +387,105 @@ Offer to start it when it is not running, returning nil when declined."
       (when (y-or-n-p "Claude coordinator is not running; start it now? ")
         (claude-emacs-bridge-start)))))
 
-(defun claude-emacs-bridge--log-message
-    (session file start-line end-line instruction)
-  "Log a bridge message sent to SESSION.
-FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
-  (let ((buffer (get-buffer-create
-                 claude-emacs-bridge-log-buffer-name)))
+(defun claude-emacs-bridge--uuid ()
+  "Return a random version 4 UUID as a string."
+  (format "%08x-%04x-4%03x-%x%03x-%08x%04x"
+          (random (expt 16 8))
+          (random (expt 16 4))
+          (random (expt 16 3))
+          (+ 8 (random 4))
+          (random (expt 16 3))
+          (random (expt 16 8))
+          (random (expt 16 4))))
+
+(defun claude-emacs-bridge--log-value (value)
+  "Render VALUE as one log field value.
+Anything holding whitespace or a quote is written as a quoted string, so a
+multi-line payload stays on the single line its event occupies."
+  (let ((text (if (stringp value) value (format "%s" value))))
+    (if (string-match-p "\\`[^ \t\n\"\\\\]+\\'" text)
+        text
+      ;; `prin1-to-string' leaves a newline as a newline, which would split
+      ;; the entry across lines.  Escape them so the event stays on one.
+      (concat "\""
+              (replace-regexp-in-string
+               "[\\\\\"\n\t]"
+               (lambda (match)
+                 (pcase match
+                   ("\\" "\\\\")
+                   ("\"" "\\\"")
+                   ("\n" "\\n")
+                   ("\t" "\\t")
+                   (_ match)))
+               text t t)
+              "\""))))
+
+(defun claude-emacs-bridge--log-event (event &rest fields)
+  "Append EVENT to the bridge log with FIELDS, a plist of keys and values.
+One event is one line, so every entry for a send can be found with a single
+search.  A field whose value is nil is left out rather than logged empty."
+  (let* ((rendered
+          (let ((parts '())
+                (rest fields))
+            (while rest
+              (let ((key (pop rest))
+                    (value (pop rest)))
+                (when value
+                  (push (format " %s=%s"
+                                (substring (symbol-name key) 1)
+                                (claude-emacs-bridge--log-value value))
+                        parts))))
+            (apply #'concat (nreverse parts))))
+         (line (concat (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                       " " (symbol-name event) rendered "\n"))
+         (buffer (get-buffer-create claude-emacs-bridge-log-buffer-name)))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (goto-char (point-max))
-        (insert (format (concat "Target: %s\n"
-                                "File: %s\n"
-                                "Lines: %d:%d\n"
-                                "Message: %s\n\n")
-                        (alist-get 'name session)
-                        file start-line end-line instruction)))
+        (insert line))
       (unless (derived-mode-p 'special-mode)
         (special-mode)))
+    (when claude-emacs-bridge-log-file
+      (condition-case nil
+          (write-region line nil claude-emacs-bridge-log-file t 'silent)
+        (file-error nil)))
     buffer))
 
+(defun claude-emacs-bridge--log-send
+    (id transport session file range content socket frame)
+  "Record that a message went out, under send ID over TRANSPORT.
+SESSION names the target, FILE and RANGE the location, and CONTENT the bytes
+actually sent rather than the ones intended.  SOCKET and FRAME belong to the
+socket path and are omitted elsewhere.  FRAME is logged only when
+`claude-emacs-bridge-log-frames' asks for it."
+  (claude-emacs-bridge--log-event
+   'send
+   :id id
+   :transport transport
+   :target (alist-get 'name session)
+   :pid (alist-get 'pid session)
+   :file file
+   :lines (format "%d-%d" (car range) (cdr range))
+   :socket socket
+   :content content
+   :frame (and claude-emacs-bridge-log-frames frame)))
+
+(defun claude-emacs-bridge--log-outcome (id result &optional reason)
+  "Record RESULT for send ID, with REASON when there is one to give."
+  (claude-emacs-bridge--log-event 'outcome :id id :result result :reason reason))
+
 (defun claude-emacs-bridge--log-status (status)
-  "Append STATUS to the bridge log."
-  (let ((buffer (get-buffer-create
-                 claude-emacs-bridge-log-buffer-name)))
+  "Append STATUS to the bridge log as its own event."
+  (claude-emacs-bridge--log-event 'status :text status))
+
+(defun claude-emacs-bridge-show-log ()
+  "Show the bridge log."
+  (interactive)
+  (let ((buffer (get-buffer-create claude-emacs-bridge-log-buffer-name)))
     (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (goto-char (point-max))
-        (insert (format "Status: %s\n\n" status)))
       (unless (derived-mode-p 'special-mode)
         (special-mode)))
-    buffer))
+    (pop-to-buffer buffer)))
 
 (defun claude-emacs-bridge-start ()
   "Start or display the dedicated Claude Code coordinator vterm."
@@ -525,6 +614,7 @@ is resolved.  INSTRUCTION tells the target session what to do."
     (let* ((session
             (with-current-buffer source-buffer
               (claude-emacs-bridge--resolve-target)))
+           (send-id (claude-emacs-bridge--uuid))
            (prompt
             (claude-emacs-bridge--format-prompt
              session
@@ -532,22 +622,28 @@ is resolved.  INSTRUCTION tells the target session what to do."
              (car range)
              (cdr range)
              instruction)))
+      ;; The prompt is logged rather than the instruction: what went out is
+      ;; what a later reader needs, wrapper and escaping included.
+      (claude-emacs-bridge--log-send
+       send-id 'relay session file range prompt nil nil)
       (with-current-buffer coordinator
         (vterm-send-string prompt t)
         (vterm-send-return))
-      (claude-emacs-bridge--log-message
-       session file (car range) (cdr range) instruction)
       (if (claude-emacs-bridge--await-submit coordinator)
-          (message "Sent to %s: %s lines %d-%d"
-                   (alist-get 'name session)
-                   file
-                   (car range)
-                   (cdr range))
+          (progn
+            ;; The coordinator accepted it.  Whether it delivered is a
+            ;; separate question this path cannot answer.
+            (claude-emacs-bridge--log-outcome send-id 'submitted)
+            (message "Sent to %s: %s lines %d-%d"
+                     (alist-get 'name session)
+                     file
+                     (car range)
+                     (cdr range)))
         (let ((warning
                (format "Message to %s may not have been submitted; check %s"
                        (alist-get 'name session)
                        claude-emacs-bridge-buffer-name)))
-          (claude-emacs-bridge--log-status warning)
+          (claude-emacs-bridge--log-outcome send-id 'unconfirmed warning)
           (message "%s" warning))))))
 
 (provide 'claude-emacs-bridge)
