@@ -36,6 +36,26 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-projects-directory
+  (expand-file-name "~/.claude/projects/")
+  "Directory holding the per-session transcripts Claude Code writes.
+A session records a queue entry here when a message is admitted, and that
+entry is how a send is confirmed."
+  :type 'directory
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-confirm-timeout 0.5
+  "Seconds to wait for a target to record that it queued a message.
+Plan 04 measured the entry appearing within milliseconds, with the writer
+flushing on its own interval.  This is several times that."
+  :type 'number
+  :group 'claude-emacs-bridge)
+
+(defcustom claude-emacs-bridge-confirm-poll-interval 0.05
+  "Seconds between reads of a target's transcript while confirming a send."
+  :type 'number
+  :group 'claude-emacs-bridge)
+
 (defcustom claude-emacs-bridge-socket-directory "/tmp/cc-socks/"
   "Directory holding Claude Code's inbox sockets.
 The bridge binds its own receipt socket here.  A recipient checks that a
@@ -854,6 +874,111 @@ Code session what to do.  Source text is not sent."
                 range file source-buffer instruction))
       (_ (user-error "Unknown delivery mode: %S" mode)))))
 
+(defun claude-emacs-bridge--transcript-slug (cwd)
+  "Return the directory name Claude Code files CWD's transcripts under."
+  (replace-regexp-in-string "[^A-Za-z0-9]" "-" cwd))
+
+(defun claude-emacs-bridge--transcript-path (session)
+  "Return the transcript file for SESSION, or nil when it cannot be found.
+Tries the slug of the session's working directory first, then looks for the
+session id anywhere under the projects directory, since that directory can be
+overridden.  When neither resolves, both attempts are logged: absence of a
+transcript is not a failed delivery, and someone checking by hand needs to
+know where it was looked for."
+  (let* ((id (alist-get 'sessionId session))
+         (cwd (alist-get 'cwd session))
+         (slug (and cwd (claude-emacs-bridge--transcript-slug cwd)))
+         (direct (and id slug
+                      (expand-file-name
+                       (concat slug "/" id ".jsonl")
+                       claude-emacs-bridge-projects-directory))))
+    (cond
+     ((and direct (file-readable-p direct)) direct)
+     ((and id
+           (car (file-expand-wildcards
+                 (expand-file-name (concat "*/" id ".jsonl")
+                                   claude-emacs-bridge-projects-directory))))))))
+
+(defun claude-emacs-bridge--log-unresolved-transcript (session)
+  "Record that SESSION's transcript could not be found, and where it was sought.
+Absence of a transcript is not a failed delivery, so this reads as a thing to
+check by hand rather than as an error."
+  (let* ((id (alist-get 'sessionId session))
+         (cwd (alist-get 'cwd session))
+         (slug (and cwd (claude-emacs-bridge--transcript-slug cwd))))
+    (claude-emacs-bridge--log-event
+     'transcript
+     :resolved "no"
+     :sessionId id
+     :slug slug
+     :direct (and id slug
+                  (expand-file-name (concat slug "/" id ".jsonl")
+                                    claude-emacs-bridge-projects-directory))
+     :searched (expand-file-name
+                (concat "*/" (or id "") ".jsonl")
+                claude-emacs-bridge-projects-directory))))
+
+(defun claude-emacs-bridge--transcript-offset (path)
+  "Return the size of PATH now, so only what is written after it is read.
+An older identical send further up the same transcript is not this one."
+  (or (and path (file-readable-p path) (file-attribute-size (file-attributes path)))
+      0))
+
+(defun claude-emacs-bridge--enqueue-line-p (line content)
+  "Return non-nil for a LINE recording CONTENT as queued by its recipient.
+The record carries no message id, so exact content is the only correlation
+available.  Its presence means the message cleared the accept gate and the
+duplicate, rate and queue guards."
+  (condition-case nil
+      (let ((entry (json-parse-string line
+                                      :object-type 'alist
+                                      :array-type 'list
+                                      :null-object nil
+                                      :false-object nil)))
+        (and (consp entry)
+             (consp (car entry))
+             (equal (alist-get 'type entry) "queue-operation")
+             (equal (alist-get 'operation entry) "enqueue")
+             (equal (alist-get 'content entry) content)))
+    (error nil)))
+
+(defun claude-emacs-bridge--await-enqueue (session path offset content)
+  "Watch SESSION's transcript from OFFSET for the entry recording CONTENT.
+PATH is where it was before the send, or nil when there was nothing there.
+Return non-nil once the entry appears.
+
+The path is looked for again on every pass while it is nil.  A session that
+has never been prompted has no transcript until a message lands, so the first
+send to a fresh session would otherwise never be confirmed.
+
+Absence is not failure: a transcript can also be missing because persistence
+is off, so the caller reports unconfirmed rather than failed."
+  (let ((deadline (+ (float-time) claude-emacs-bridge-confirm-timeout)))
+    (catch 'confirmed
+      (while t
+        (unless path
+          (setq path (claude-emacs-bridge--transcript-path session)))
+        (when (and path (file-readable-p path))
+          (let ((size (file-attribute-size (file-attributes path))))
+            (when (and size (> size offset))
+              (with-temp-buffer
+                (insert-file-contents path nil offset size)
+                ;; A read can land mid-write, so drop a trailing partial line.
+                (goto-char (point-max))
+                (unless (bolp)
+                  (delete-region (line-beginning-position) (point-max)))
+                (goto-char (point-min))
+                (while (not (eobp))
+                  (when (claude-emacs-bridge--enqueue-line-p
+                         (buffer-substring-no-properties
+                          (line-beginning-position) (line-end-position))
+                         content)
+                    (throw 'confirmed t))
+                  (forward-line 1))))))
+        (when (>= (float-time) deadline)
+          (throw 'confirmed nil))
+        (sleep-for claude-emacs-bridge-confirm-poll-interval)))))
+
 (defun claude-emacs-bridge--write-frame (socket frame)
   "Write FRAME to SOCKET and close.
 Signals a `file-error' when the socket cannot be reached, which plan 04 notes
@@ -869,6 +994,37 @@ is the one failure a sender can detect on the connection itself."
           (process-send-string process frame)
           (process-send-eof process))
       (ignore-errors (delete-process process)))))
+
+(defun claude-emacs-bridge--send-outcome (frame confirmed target file lines)
+  "Return the outcome of a send as a cons of a result and the text for it.
+FRAME is a report from the recipient, if one arrived.  CONFIRMED says whether
+the recipient recorded queueing the message.  TARGET, FILE and LINES describe
+what was sent.
+
+A report is checked first because it carries the recipient's own reason.  The
+two cannot both be true in practice: a message that was held or dropped was
+never queued."
+  (cond
+   (frame
+    (let ((status (alist-get 'status frame))
+          (drop (alist-get 'drop_reason frame))
+          (reason (claude-emacs-bridge--receipt-reason frame)))
+      (cons 'failed
+            (if (equal drop "duplicate")
+                ;; Ordinary to hit: the same instruction about the same lines
+                ;; within the recipient's duplicate window.  Neither success
+                ;; nor a bug here, and it must not read as either.
+                (format
+                 (concat "%s already had this exact message recently and did "
+                         "not receive it again (duplicate). %s lines %s")
+                 target file lines)
+              (format "%s did not receive %s lines %s: %s (%s)"
+                      target file lines reason status)))))
+   (confirmed
+    (cons 'delivered (format "Delivered to %s: %s lines %s" target file lines)))
+   (t
+    (cons 'unconfirmed
+          (format "Sent to %s: %s lines %s (unconfirmed)" target file lines)))))
 
 (defun claude-emacs-bridge--send-via-socket (range file source-buffer
                                                    instruction)
@@ -897,12 +1053,24 @@ the connection, so confirmation has to come from elsewhere."
           (socket . ,socket)
           (pending . t)))
     (condition-case err
-        (progn
+        (let* ((transcript (claude-emacs-bridge--transcript-path session))
+               (offset (claude-emacs-bridge--transcript-offset transcript)))
           (claude-emacs-bridge--write-frame socket frame)
-          (claude-emacs-bridge--finish-send id)
-          (claude-emacs-bridge--log-outcome
-           id 'unconfirmed "no confirmation is read yet")
-          (message "Sent to %s: %s lines %s (unconfirmed)" target file lines))
+          (let* ((confirmed (claude-emacs-bridge--await-enqueue
+                             session transcript offset content))
+                 (report (gethash id claude-emacs-bridge--receipts))
+                 (outcome (claude-emacs-bridge--send-outcome
+                           report confirmed target file lines)))
+            ;; Stop waiting only once the report has been collected, or a
+            ;; frame arriving mid-wait would be logged as late as well.
+            (claude-emacs-bridge--finish-send id)
+            (remhash id claude-emacs-bridge--receipts)
+            (unless (or confirmed report
+                        (claude-emacs-bridge--transcript-path session))
+              (claude-emacs-bridge--log-unresolved-transcript session))
+            (claude-emacs-bridge--log-outcome id (car outcome) (cdr outcome))
+            (claude-emacs-bridge--log-status (cdr outcome))
+            (message "%s" (cdr outcome))))
       (file-error
        (claude-emacs-bridge--finish-send id)
        (claude-emacs-bridge--log-outcome

@@ -1017,6 +1017,280 @@ can read is a relay that leaks whatever a path in an instruction points at."
     (should (string-match-p (format "%d" (emacs-pid))
                             (claude-emacs-bridge--receipt-socket-path)))))
 
+;;; Reporting the outcome
+
+(ert-deftest claude-emacs-bridge--send-outcome-test/failure-quotes-the-recipient ()
+  "A recipient's own reason is reported verbatim rather than paraphrased."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((frame '((status . "held")
+                   (reason . "held for the recipient user's approval"))))
+      (let ((outcome (claude-emacs-bridge--send-outcome
+                      frame nil "task-1" "/tmp/a.go" "1-2")))
+        (should (eq (car outcome) 'failed))
+        (should (string-match-p "held for the recipient user's approval"
+                                (cdr outcome)))))))
+
+(ert-deftest claude-emacs-bridge--send-outcome-test/duplicate-drop-reads-as-a-drop ()
+  "A duplicate drop says the target already had this text and did not get it again.
+It must not read as success, nor as a bug in the bridge, because it is neither."
+  (claude-emacs-bridge-tests--with-receipts
+    (let* ((frame '((status . "dropped") (drop_reason . "duplicate")
+                    (reason . "the recipient dropped your message")))
+           (outcome (claude-emacs-bridge--send-outcome
+                      frame nil "task-1" "/tmp/a.go" "1-2"))
+           (text (cdr outcome)))
+      (should (eq (car outcome) 'failed))
+      (should (string-match-p "duplicate" text))
+      (should (string-match-p "not deliver\\|did not\\|never" text))
+      (should-not (string-match-p "Sent to" text)))))
+
+(ert-deftest claude-emacs-bridge--send-outcome-test/confirmed-is-delivered ()
+  "The queue entry found means delivered."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((outcome (claude-emacs-bridge--send-outcome
+                      nil t "task-1" "/tmp/a.go" "1-2")))
+      (should (eq (car outcome) 'delivered))
+      (should (string-match-p "task-1" (cdr outcome)))
+      (should (string-match-p "/tmp/a\\.go" (cdr outcome))))))
+
+(ert-deftest claude-emacs-bridge--send-outcome-test/neither-is-unconfirmed ()
+  "Nothing either way is said plainly, not dressed up as one of the others."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((outcome (claude-emacs-bridge--send-outcome
+                      nil nil "task-1" "/tmp/a.go" "1-2")))
+      (should (eq (car outcome) 'unconfirmed))
+      (should (string-match-p "unconfirmed\\|could not confirm" (cdr outcome))))))
+
+(ert-deftest claude-emacs-bridge--send-outcome-test/a-frame-beats-a-queue-entry ()
+  "A reported failure wins, because it carries a reason worth showing."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((outcome (claude-emacs-bridge--send-outcome
+                      '((status . "held") (reason . "waiting")) t
+                    "task-1" "/tmp/a.go" "1-2")))
+      (should (eq (car outcome) 'failed)))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/confirms-from-the-transcript ()
+  "A send whose queue entry appears reports delivered."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((session '((name . "task-1") (pid . 7) (startedAt . 1)
+                     (sessionId . "abc") (cwd . "/tmp/one")
+                     (messagingSocketPath . "/tmp/cc-socks/7.sock")))
+          (shown nil))
+      (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                 (lambda () session))
+                ((symbol-function 'claude-emacs-bridge--write-frame)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'claude-emacs-bridge--transcript-path)
+                 (lambda (_) "/tmp/fake-transcript.jsonl"))
+                ((symbol-function 'claude-emacs-bridge--transcript-offset)
+                 (lambda (_) 0))
+                ((symbol-function 'claude-emacs-bridge--await-enqueue)
+                 (lambda (&rest _) t))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+        (with-temp-buffer
+          (claude-emacs-bridge--send-via-socket
+           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+      (should (string-match-p "task-1" shown))
+      (should-not (string-match-p "unconfirmed" shown))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (should (string-match-p " outcome .*result=delivered"
+                                (buffer-string)))))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/reports-a-frame-that-arrived-while-waiting ()
+  "A failure reported during the wait is the send's own outcome to give."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((session '((name . "task-1") (pid . 7) (startedAt . 1)
+                     (sessionId . "abc") (cwd . "/tmp/one")
+                     (messagingSocketPath . "/tmp/cc-socks/7.sock")))
+          (shown nil))
+      (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                 (lambda () session))
+                ((symbol-function 'claude-emacs-bridge--write-frame)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'claude-emacs-bridge--transcript-path)
+                 (lambda (_) nil))
+                ((symbol-function 'claude-emacs-bridge--await-enqueue)
+                 ;; The recipient reports a drop while the send is waiting.
+                 (lambda (&rest _)
+                   (maphash (lambda (id _record)
+                              (puthash id '((status . "dropped")
+                                            (drop_reason . "duplicate")
+                                            (reason . "already had this"))
+                                       claude-emacs-bridge--receipts))
+                            claude-emacs-bridge--sends)
+                   nil))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
+        (with-temp-buffer
+          (claude-emacs-bridge--send-via-socket
+           '(1 . 2) "/tmp/example.go" (current-buffer) "Look.")))
+      (should (string-match-p "duplicate" shown))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (should (string-match-p " outcome .*result=failed" (buffer-string)))))))
+
+;;; Confirming from the transcript
+
+(ert-deftest claude-emacs-bridge--transcript-slug-test/dashes-everything-else ()
+  "The slug is the working directory with every other character dashed."
+  (should (equal (claude-emacs-bridge--transcript-slug
+                  "/Users/dhanush/github.com/claude-emacs-bridge")
+                 "-Users-dhanush-github-com-claude-emacs-bridge"))
+  (should (equal (claude-emacs-bridge--transcript-slug "/tmp/a_b.c")
+                 "-tmp-a-b-c")))
+
+(ert-deftest claude-emacs-bridge--transcript-path-test/finds-the-direct-path ()
+  "The transcript sits under the slug of the session's working directory."
+  (let* ((root (file-name-as-directory (make-temp-file "bridge-projects" t)))
+         (claude-emacs-bridge-projects-directory root)
+         (dir (expand-file-name "-tmp-one/" root))
+         (path (expand-file-name "abc.jsonl" dir)))
+    (make-directory dir t)
+    (with-temp-file path (insert ""))
+    (should (equal (claude-emacs-bridge--transcript-path
+                    '((sessionId . "abc") (cwd . "/tmp/one")))
+                   path))))
+
+(ert-deftest claude-emacs-bridge--transcript-path-test/falls-back-to-a-glob ()
+  "A transcript kept somewhere else is still found by its session id."
+  (let* ((root (file-name-as-directory (make-temp-file "bridge-projects" t)))
+         (claude-emacs-bridge-projects-directory root)
+         (dir (expand-file-name "-somewhere-else/" root))
+         (path (expand-file-name "abc.jsonl" dir)))
+    (make-directory dir t)
+    (with-temp-file path (insert ""))
+    (should (equal (claude-emacs-bridge--transcript-path
+                    '((sessionId . "abc") (cwd . "/tmp/one")))
+                   path))))
+
+(ert-deftest claude-emacs-bridge--transcript-path-test/unresolved-logs-what-it-tried ()
+  "When neither path resolves, the log names both, so it can be checked by hand."
+  (let* ((root (file-name-as-directory (make-temp-file "bridge-projects" t)))
+         (claude-emacs-bridge-projects-directory root)
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-transcript-log-test*"))
+         (claude-emacs-bridge-log-file nil))
+    (unwind-protect
+        (progn
+          (should-not (claude-emacs-bridge--transcript-path
+                       '((sessionId . "abc") (cwd . "/tmp/one"))))
+          (claude-emacs-bridge--log-unresolved-transcript
+           '((sessionId . "abc") (cwd . "/tmp/one")))
+          (with-current-buffer claude-emacs-bridge-log-buffer-name
+            (let ((text (buffer-string)))
+              (should (string-match-p "transcript" text))
+              (should (string-match-p "sessionId=abc" text))
+              (should (string-match-p "slug=-tmp-one" text))
+              (should (string-match-p "direct=" text)))))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(ert-deftest claude-emacs-bridge--transcript-offset-test/zero-for-a-missing-file ()
+  "A transcript that does not exist yet is read from the beginning."
+  (should (= (claude-emacs-bridge--transcript-offset nil) 0))
+  (should (= (claude-emacs-bridge--transcript-offset "/tmp/bridge-no-file.jsonl") 0)))
+
+(ert-deftest claude-emacs-bridge--transcript-offset-test/is-the-size-before-the-send ()
+  "An existing transcript is read from its end, not its start."
+  (let ((path (make-temp-file "bridge-transcript")))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "some earlier lines\n"))
+          (should (= (claude-emacs-bridge--transcript-offset path)
+                     (length "some earlier lines\n"))))
+      (delete-file path))))
+
+(ert-deftest claude-emacs-bridge--enqueue-line-p-test/matches-an-exact-enqueue ()
+  "The enqueue line for this exact content is the delivery signal."
+  (let ((content "File: /tmp/a.go\nLines: 1-2\nInstruction: go"))
+    (should (claude-emacs-bridge--enqueue-line-p
+             (json-encode `((type . "queue-operation")
+                            (operation . "enqueue")
+                            (sessionId . "abc")
+                            (content . ,content)))
+             content))))
+
+(ert-deftest claude-emacs-bridge--enqueue-line-p-test/rejects-near-misses ()
+  "Only an exact enqueue for this content counts.
+The record carries no message id, so exact content is the only correlation."
+  (let ((content "File: /tmp/a.go\nLines: 1-2\nInstruction: go"))
+    ;; A dequeue for the same message.
+    (should-not (claude-emacs-bridge--enqueue-line-p
+                 (json-encode '((type . "queue-operation")
+                                (operation . "dequeue")
+                                (sessionId . "abc")))
+                 content))
+    ;; An enqueue for something else.
+    (should-not (claude-emacs-bridge--enqueue-line-p
+                 (json-encode '((type . "queue-operation")
+                                (operation . "enqueue")
+                                (content . "a different message")))
+                 content))
+    ;; Nearly this content.
+    (should-not (claude-emacs-bridge--enqueue-line-p
+                 (json-encode `((type . "queue-operation")
+                                (operation . "enqueue")
+                                (content . ,(concat content " "))))
+                 content))
+    ;; Not a queue operation at all.
+    (should-not (claude-emacs-bridge--enqueue-line-p
+                 (json-encode `((type . "user") (content . ,content)))
+                 content))
+    (should-not (claude-emacs-bridge--enqueue-line-p "not json" content))))
+
+(ert-deftest claude-emacs-bridge--await-enqueue-test/finds-a-line-after-the-offset ()
+  "A line written after the send is the confirmation."
+  (let ((path (make-temp-file "bridge-transcript"))
+        (content "File: /tmp/a.go\nLines: 1-2\nInstruction: go"))
+    (unwind-protect
+        (let ((claude-emacs-bridge-confirm-timeout 0.5)
+              (claude-emacs-bridge-confirm-poll-interval 0.01))
+          (with-temp-file path (insert "older noise\n"))
+          (let ((offset (claude-emacs-bridge--transcript-offset path)))
+            (write-region
+             (concat (json-encode `((type . "queue-operation")
+                                    (operation . "enqueue")
+                                    (content . ,content)))
+                     "\n")
+             nil path t 'silent)
+            (should (claude-emacs-bridge--await-enqueue nil path offset content))))
+      (delete-file path))))
+
+(ert-deftest claude-emacs-bridge--await-enqueue-test/ignores-an-earlier-identical-line ()
+  "An identical send already in the transcript is not this one.
+Reading from the noted offset is what keeps them apart."
+  (let ((path (make-temp-file "bridge-transcript"))
+        (content "File: /tmp/a.go\nLines: 1-2\nInstruction: go"))
+    (unwind-protect
+        (let ((claude-emacs-bridge-confirm-timeout 0.1)
+              (claude-emacs-bridge-confirm-poll-interval 0.01))
+          (with-temp-file path
+            (insert (json-encode `((type . "queue-operation")
+                                   (operation . "enqueue")
+                                   (content . ,content)))
+                    "\n"))
+          (should-not (claude-emacs-bridge--await-enqueue
+                       nil path (claude-emacs-bridge--transcript-offset path)
+                       content)))
+      (delete-file path))))
+
+(ert-deftest claude-emacs-bridge--await-enqueue-test/times-out-without-a-line ()
+  "Nothing arriving in time is unconfirmed, and the wait is bounded."
+  (let ((path (make-temp-file "bridge-transcript")))
+    (unwind-protect
+        (let ((claude-emacs-bridge-confirm-timeout 0.1)
+              (claude-emacs-bridge-confirm-poll-interval 0.01)
+              (start (float-time)))
+          (should-not (claude-emacs-bridge--await-enqueue nil path 0 "never written"))
+          (should (< (- (float-time) start) 2.0)))
+      (delete-file path))))
+
+(ert-deftest claude-emacs-bridge--await-enqueue-test/no-transcript-is-unconfirmed ()
+  "With no transcript to read there is nothing to confirm from."
+  (let ((claude-emacs-bridge-confirm-timeout 0.05)
+        (claude-emacs-bridge-confirm-poll-interval 0.01))
+    (should-not (claude-emacs-bridge--await-enqueue nil nil 0 "anything"))))
+
 ;;; Writing to a target socket
 
 (ert-deftest claude-emacs-bridge--write-frame-test/writes-then-closes ()
