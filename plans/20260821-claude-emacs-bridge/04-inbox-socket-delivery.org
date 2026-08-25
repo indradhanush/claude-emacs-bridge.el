@@ -201,10 +201,11 @@ this is visible rather than silent.
 The bridge is in daily use. That constrains this work more than anything else
 in the plan.
 
-The relay stays the default. The socket path goes in behind an option that is
-off unless asked for, and the default only changes once the socket path has been
-tested properly and carried real traffic. A working setup does not get swapped
-out for an untested one.
+The relay and the socket are two exclusive modes, not a default and an
+alternative. One is active at a time. Switching means releasing what the active
+mode holds before the other can be used, and the first send in a fresh Emacs
+asks which mode to use. Nothing is chosen on the user's behalf, and a working
+setup is never replaced without being asked for.
 
 Development must not disturb the running coordinator or any live session.
 Experiments use throwaway sessions in a scratch directory, started and killed by
@@ -217,9 +218,8 @@ leftover relay code for something still load-bearing.
 
 * Cleanup
 
-Do these only after the socket path has been the default for long enough to
-trust, and only once nothing in the plans still points at the relay as a
-fallback.
+Do these only after the socket mode has carried real traffic for long enough to
+trust, and only once the relay is no longer a mode anyone picks.
 
 - [ ] Delete the coordinator vterm, its startup command, and the =DO_NOT_TRACK=
   workaround that exists only because the relay is a Claude session.
@@ -236,10 +236,11 @@ fallback.
 
 * Next Steps
 
-- [ ] Write the implementation plan, covering the receipt socket's lifetime and
-  the option that selects the socket path, defaulting to the relay.
-- [ ] Work out how the socket path gets tested without touching the coordinator
-  that is in daily use.
+- [X] Write the implementation plan. Done in
+  [[file:./05-socket-send-path.org][Socket Send Path]], covering the mode
+  choice, the switch, the receipt socket's lifetime and observability.
+- [X] Work out how the socket path gets tested without touching the coordinator
+  that is in daily use. Covered by the Testing section of plan 05.
 - Context: feasibility and success detection are both settled. A send can be
   positively confirmed, failures come back with a reason, and the remaining work
   is writing the thing.

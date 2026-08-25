@@ -1,6 +1,6 @@
 :PROPERTIES:
 :STATUS: DRAFT
-:STATUS_UPDATED_ON: 2026-08-24 17:52
+:STATUS_UPDATED_ON: 2026-08-25
 :END:
 #+title: Socket Send Path
 #+date: 2026-08-24
@@ -14,25 +14,31 @@ inbox socket. The terminal and the relay session both drop out of it.
 mechanism. Everything here builds on facts recorded there and does not re-open
 them.
 
-The relay stays the default. The socket path goes in behind an option that is
-off unless asked for. The default only flips once the socket path has carried
-real traffic. Nothing in the relay path is deleted by this work; the Cleanup
-list in plan 04 stays untouched.
+There is no default transport. The relay and the socket are two exclusive
+modes. One of them is active at a time, and switching means releasing what the
+active one holds before the other can be used. The first send in a fresh Emacs
+asks which mode to use.
+
+Nothing in the relay path is deleted by this work. The Cleanup list in plan 04
+stays untouched, because the relay stays a mode someone can pick.
 
 * Architecture
 
-Both paths live side by side. One option picks between them, and the split
-happens once, early in the send.
+Both paths exist in the package, but only one is live at a time. The mode is
+chosen once and the split happens early in the send.
 
 #+begin_example
                         claude-emacs-bridge-send
                                     │
                                     ▼
                 ┌───────────────────────────────────┐
-                │ claude-emacs-bridge-transport     │
-                │ 'relay (default)   |   'socket    │
+                │ claude-emacs-bridge--mode         │
+                │ unset until the first send asks   │
                 └───────┬───────────────────┬───────┘
-     relay path         │                   │        socket path
+                        │                   │
+       mode is 'relay   │  one branch is    │   mode is 'socket
+       socket holds     │  live, the other  │   relay holds
+       nothing          │  is torn down     │   nothing
                         ▼                   ▼
     ┌───────────────────────────┐  ┌───────────────────────────┐
     │ format-prompt             │  │ registry discovery        │
@@ -64,36 +70,233 @@ happens once, early in the send.
                    │ transcript .jsonl         │
                    │ receipt socket frame      │
                    └───────────────────────────┘
+
+    ┌──────────────────────────────────────────────────────────┐
+    │ claude-emacs-bridge-switch-transport                     │
+    │ release the live column, clear targets, then bind other  │
+    └──────────────────────────────────────────────────────────┘
 #+end_example
 
 The relay column is exactly what ships today. The socket column is new. Only
-the top box is shared.
+the top box is shared, and only one column has anything bound at a time.
 
 Both columns also write to the log buffer. That side channel is left out of the
 diagram to keep it readable and is described in
 [[*Seeing What Happened][Seeing What Happened]].
 
-* Choosing A Path
+* Choosing A Mode
 
-One option, read once per send.
+The relay and the socket are not a default and an alternative. They are two
+modes, and exactly one is usable at any moment.
 
-- =claude-emacs-bridge-transport= :: a =choice= of =relay= or =socket=,
-  defaulting to =relay=.
+- =claude-emacs-bridge--mode= :: runtime state, =nil=, =relay= or =socket=.
+  =nil= means nothing has been chosen yet and nothing is bound.
+- =claude-emacs-bridge-preferred-transport= :: a saved option, =nil= until the
+  first choice is made. It is the remembered mode, and it is what survives a
+  restart.
+
+Keeping the runtime mode in a variable and the choice in an option matters, and
+now carries weight. The mode says what is bound right now. The option says what
+was chosen. Setting an option cannot release a coordinator vterm, so the two
+cannot be the same thing.
+
+** The mode is chosen once, ever
+
+| First ever use | Prompt, then save the answer           |
+| Every restart  | Use the saved mode, no prompt          |
+| Change it      | =claude-emacs-bridge-switch-transport= |
+
+The choice is permanent by design. A restart does not re-ask and does not
+reconsider. The only thing that changes a saved mode is the switch command,
+which also writes the new value through to the option, so a switch survives a
+restart the same way the first choice does.
+
+The prompt itself is the moment of choosing. It saves. There is no second
+question asking whether to remember the answer.
+
+** The first send asks
+
+=claude-emacs-bridge--ensure-mode= returns the active mode.
+
+1. When =claude-emacs-bridge--mode= is already set, return it.
+2. Otherwise seed it from =claude-emacs-bridge-preferred-transport= and return
+   that.
+3. Otherwise prompt, save the answer to the option with
+   =customize-save-variable=, set the mode, and return it.
+
+Step 3 runs once in the life of a configuration. Step 2 is what every later
+Emacs does.
+
+A saved value that is neither =relay= nor =socket=, which only a hand-edited
+custom file produces, is treated as unset. Say so in the message and prompt
+again rather than guessing which was meant.
+
+It is called from =claude-emacs-bridge-send=, before the line range is computed
+and before any target is resolved, so the user is not asked to pick a target for
+a mode they have not chosen. It is also called from
+=claude-emacs-bridge-list-sessions= and =claude-emacs-bridge-select-session=,
+because both read a session list and the two modes read different ones.
+
+The prompt names what each mode does, not how it works:
+
+- Relay, which runs a Claude session in a terminal you can watch.
+- Socket, which delivers straight to the target with no terminal.
+
+It says the answer is remembered, and it names
+=claude-emacs-bridge-switch-transport= as the way to change it later. Both
+belong in the prompt. A question that is asked once and never again has to say
+so, or the user answers it as though it were provisional.
+
+** A saved mode that cannot be honoured
+
+A saved preference can name a mode whose resources are not available. Socket
+mode saved on a machine where =/tmp/cc-socks/= does not exist. Relay mode saved
+where =vterm= is not installed, which is possible because the package
+byte-compiles without it on purpose.
+
+The rule: fail and explain. Never fall back to the other mode.
+
+A silent fallback would send through a mechanism the user did not pick, using
+targets and a message format they did not expect, and the only sign would be
+that the coordinator window never appeared. That is worse than an error.
+
+=--ensure-mode= does not probe. It seeds and returns. The check happens where
+the resource is actually acquired, because that code already has to handle the
+resource being missing and probing on every send would duplicate it. What
+changes is the message. Each failure names three things: the saved mode, the
+thing that is missing, and =claude-emacs-bridge-switch-transport=.
+
+- Socket mode, no =/tmp/cc-socks/= :: the receipt socket cannot bind. This is
+  distinct from finding no sessions, and the message says so, because a missing
+  directory and an empty picker are different problems.
+- Relay mode, no =vterm= :: =claude-emacs-bridge-start= already calls
+  =require=. Catch the failure and re-signal it in the same shape.
+
+** One mode at a time
+
+=claude-emacs-bridge-start= and =claude-emacs-bridge-clear= are relay machinery.
+In socket mode they signal a =user-error= that names the active mode and names
+=claude-emacs-bridge-switch-transport=. They do not silently do nothing, and
+they do not offer to switch inline. Switching releases resources, so it is a
+deliberate act and not a side effect of running the wrong command.
+
+In an unset mode they call =--ensure-mode= like everything else. Someone who
+runs =claude-emacs-bridge-start= first is asked the same question, and picking
+socket gets them the error above rather than a coordinator they did not want.
+
+Every error message from a mode-gated command names the active mode. The mode is
+global state that changes what commands do, and an error that does not say which
+mode is active is the kind of message that costs an hour.
+
+** The send branch
 
 =claude-emacs-bridge-send= keeps its interactive form, its argument checks and
-its line-range work. After that it branches:
+its line-range work. After =--ensure-mode= it branches:
 
 - =claude-emacs-bridge--send-via-relay= :: the current body, moved across
-  unchanged. It still resolves the coordinator buffer, calls
-  =--format-prompt=, pastes, and waits on =--await-submit=.
+  unchanged. It still resolves the coordinator buffer, calls =--format-prompt=,
+  pastes, and waits on =--await-submit=.
 - =claude-emacs-bridge--send-via-socket= :: the new path.
 
-The branch sits above target resolution, because the two paths resolve targets
-from different sources. The relay path keeps =claude agents --json=. The socket
-path reads the registry.
+The branch sits above target resolution, because the two modes resolve targets
+from different sources. The relay mode keeps =claude agents --json=. The socket
+mode reads the registry.
 
 Nothing else in the relay path moves. A reviewer should be able to see that the
 extracted function is a copy.
+
+* Switching Modes
+
+=claude-emacs-bridge-switch-transport= is the only supported way to change mode.
+It reads the mode to switch to, releases what the current one holds, clears the
+per-context targets, sets =claude-emacs-bridge--mode=, and saves the new value
+to =claude-emacs-bridge-preferred-transport=.
+
+Saving is not optional. A switch that only changed the runtime mode would be
+undone by the next restart, and a user who switched deliberately would find
+themselves back in the old mode with no explanation.
+
+** What each mode holds
+
+- Relay :: the coordinator vterm buffer and the Claude session running inside
+  it. Killing the buffer ends the session.
+- Socket :: the bound receipt socket, its file in =/tmp/cc-socks/=, the
+  =--sends= records, and an idle subscription if one is ever added.
+- Both :: the per-context target associations in =--targets=.
+
+** Targets do not survive a switch
+
+A switch clears =--targets=.
+
+The stored value is a =(pid . startedAt)= pair in both modes, so carrying it
+across would work mechanically. That is not the question. The question is
+whether the choice it records still means the same thing.
+
+It does not. A relay target was picked so a model could route to it by name, and
+plan 04 records the relay doing that wrong: asked for =byohctl-ci-integration=
+it sent to =byohctl-teamcity-integration=. A socket target is a pid and a socket
+path, and it goes exactly where it says. Carrying an association forward means
+inheriting a choice made under a mechanism known to have misrouted, and then
+delivering to it precisely.
+
+The two modes also discover from different sources, so a row present in one may
+be absent in the other, and a carried association can read as live in one mode
+and stale in the other.
+
+The cost of clearing is one picker prompt per context after a switch. Plan 01
+already treats these associations as disposable and keeps them in memory only.
+Clearing them is consistent with that, and it is cheap.
+
+** The teardown
+
+Leaving relay mode:
+
+1. Check the coordinator's input box for unsent work. =--pending-paste-p=
+   already does exactly this check, bounded by =--paste-tail-window=. Reuse it.
+2. If a paste is pending, refuse. Name the buffer and say to submit or clear it
+   first. Killing the vterm there discards a message the user believes was sent,
+   which is the same failure
+   [[file:./02-paste-submit-reliability.org][Paste Submit Reliability]] exists to
+   stop.
+3. Otherwise kill the coordinator buffer, but only when its
+   =--coordinator-p= flag is set. A buffer with the right name and no flag is a
+   name collision and is never killed, which is the rule the package already
+   follows.
+
+Leaving socket mode:
+
+1. Delete the receipt socket process and unlink its file.
+2. Log a line naming any send records still inside the sixty-second window plan
+   04 gives for drop reporting. Those sends can no longer be told about, and the
+   log should say so rather than let them vanish.
+3. Drop =--sends=.
+
+The command offers to do the teardown rather than refusing until the user does
+it by hand. It is fully scriptable, and making a user kill a buffer manually
+before a command will work is busywork. The one refusal is the pending paste,
+because only the user can decide what to do with an unsent message.
+
+The whole teardown is confirmed once, after the command has listed what it is
+about to release.
+
+** What exclusive modes fix
+
+Three consequences of the earlier framing are worth re-checking.
+
+- The coordinator pid no longer leaks into socket discovery. *Fixed.* In socket
+  mode there is no coordinator, because entering socket mode released it. So
+  =--registry-sessions= drops its coordinator-pid clause entirely. It filters on
+  =messagingSocketPath=, name, pid, =sessionId= and =cwd=, and nothing else. A
+  session someone else named =emacs-server= simply appears in the picker like
+  any other, which is honest.
+- =--resolve-target= still gains a session-list argument, so a socket slice
+  still edits code the relay calls. *Not fixed, better justified.* Both modes
+  resolve one target per context and only the source differs, so the argument
+  makes it mode-agnostic machinery rather than relay code bent for one caller.
+- Two message formats still coexist and can still drift. *Not fixed.* Both
+  formats remain in the file and both remain reachable, just never at the same
+  time. The test asserting an =@path= reaches the socket content unescaped is
+  still needed.
 
 * Finding A Target
 
@@ -113,7 +316,6 @@ A row is kept when all of these hold:
 - =name= is a non-empty string.
 - =pid= is an integer.
 - =sessionId= and =cwd= are strings.
-- =pid= is not the coordinator's pid.
 
 =messagingSocketPath= is the registry's version of the =kind= test the relay
 path uses. Plan 01 records why that test exists: background agents carry a name
@@ -125,10 +327,6 @@ Requiring the socket file to exist also drops rows left behind by sessions that
 have died. It is not a full liveness test. A row that survives the filter and
 then fails to connect is the one failure the sender can detect, per plan 04, so
 that case reports a real error rather than a silent success.
-
-The coordinator is still excluded while the relay exists. It is a normal
-interactive session with its own registry row, and offering it as a target
-would be confusing.
 
 Two things are reused as they are:
 
@@ -330,9 +528,9 @@ over:
 The at-mention escaping in =--escape-mentions= exists only because text is
 typed into an input box, where Claude Code expands =@path= into an attached
 file before the model runs. Nothing is typed on the socket path, so it is not
-needed there. It stays in the package because the relay path still calls it,
-and the relay path is still the default. Removing it is on plan 04's Cleanup
-list, not here.
+needed there. It stays in the package because the relay mode still calls it,
+and the relay stays a mode someone can pick. Removing it is on plan 04's
+Cleanup list, not here.
 
 =--format-prompt= is likewise untouched.
 
@@ -360,8 +558,8 @@ The package already has a log buffer, named by
 else.
 
 The socket path extends that log. It does not add a second one. Two formats in
-one buffer defeats searching it, and while the relay is still the default the
-two paths have to be comparable. A bug seen on one path should be describable
+one buffer defeats searching it, and while both modes exist the two paths have
+to be comparable. A bug seen on one path should be describable
 in the same words on the other, so the relay path comes up to the same standard
 in the same change.
 
@@ -412,9 +610,9 @@ rendered summary of the frame cannot show a field that was serialised wrongly,
 a missing newline, or an encoding problem, because the summary is built from the
 same values the frame was.
 
-Recommendation: on by default while the socket path is opt-in. Someone who has
-turned the transport on is testing it, and that is the moment the frame is worth
-having. Revisit when the socket path becomes the default.
+Recommendation: on while the socket mode is new. Someone who picked socket mode
+is testing it, and that is the moment the frame is worth having. Revisit once
+the socket mode has carried real traffic.
 
 The frame contains the file path and the instruction. Both are already in the
 log, so this adds no exposure the log buffer did not have.
@@ -510,14 +708,23 @@ enough to be one.
 
 * Tasks
 
-Each slice leaves the package working. The socket path is unreachable until the
-user sets the option, so an unfinished slice cannot break a real send.
+Each slice leaves the package working. Socket mode is unreachable until a user
+picks it, so an unfinished slice cannot break a relay send.
 
-** TODO Add the transport option and the branch
-Add =claude-emacs-bridge-transport=, defaulting to =relay=. Extract the current
-send body into =--send-via-relay= without changing it. Add
-=--send-via-socket= as a stub that signals an error saying it is not
-implemented. Test that each option value calls the matching function.
+** TODO Add the mode, the first-use prompt and the branch
+Add =claude-emacs-bridge--mode=, =claude-emacs-bridge-preferred-transport= and
+=--ensure-mode=. Extract the current send body into =--send-via-relay= without
+changing it. Add =--send-via-socket= as a stub that signals an error saying it
+is not implemented.
+
+Gate =claude-emacs-bridge-start= and =claude-emacs-bridge-clear= on the mode,
+with an error naming the active mode and the switch command.
+
+Test that an unset mode prompts and saves the answer, that a saved preference
+seeds without prompting, that an unrecognised saved value prompts again, that
+each mode calls the matching send function, that the relay commands error in
+socket mode with the mode named, and that a saved mode whose resources are
+missing errors naming the mode, the missing thing and the switch command.
 
 ** TODO Build the log
 Add =--log-event=, the send id, =claude-emacs-bridge-log-frames=, the file sink
@@ -535,10 +742,12 @@ and does nothing when it is nil, and that the show command pops the buffer.
 
 ** TODO Read targets from the session registry
 Add =claude-emacs-bridge-registry-directory= and
-=--registry-sessions=. Give =--resolve-target= a session-list argument. Test
-the filter against fixture JSON files in a temp directory, covering a row with
-no =messagingSocketPath=, a row whose socket file is gone, the coordinator's
-own row, and a good row.
+=--registry-sessions=. Give =--resolve-target= a session-list argument, and
+route =claude-emacs-bridge-list-sessions= and
+=claude-emacs-bridge-select-session= by mode. Test the filter against fixture
+JSON files in a temp directory, covering a row with no =messagingSocketPath=, a
+row whose socket file is gone, a row missing =sessionId= or =cwd=, and a good
+row. Test that each mode reads its own source.
 
 ** TODO Build the message content and the frame
 Add =--socket-content=, =--socket-frame= and =--uuid=. Test the content shape,
@@ -579,6 +788,20 @@ Combine the receipt frame and the transcript result into one of the three
 outcomes, log it and show it. Test all three, and test the duplicate drop
 specifically, asserting the reported text does not read as success.
 
+** TODO Add the switch command
+Add =claude-emacs-bridge-switch-transport=: read the mode to switch to, list
+what is about to be released, confirm once, tear down, clear =--targets=, set
+the mode and save it to =claude-emacs-bridge-preferred-transport=.
+
+Test that it refuses while a paste is pending and names the buffer, that it
+kills a flagged coordinator buffer and never an unflagged one, that it deletes
+the receipt socket and unlinks its file, that it logs abandoned send records,
+that =--targets= is emptied, that the new mode is saved to the option, and that
+switching to the active mode does nothing.
+
+This lands after both modes work, because it can only be tested once there is
+something on each side to release.
+
 ** TODO Add the live throwaway-session test
 Gated so the default batch run does not need Claude installed.
 
@@ -611,6 +834,11 @@ Almost all of it. The existing suite fakes collaborators with =cl-letf= over
 - Transcript slug, path resolution, offset, line matching and the await loop,
   against files written into a temp directory.
 - Outcome selection and its reported text.
+- Mode selection, the first-use prompt and its save, the seeded preference, an
+  unrecognised saved value, the mode-gated relay commands, and a saved mode
+  whose resources are missing.
+- The switch command's teardown, its pending-paste refusal, and the cleared
+  targets.
 - Log event formatting, payload quoting, the frame option, and the file sink
   against a temp file.
 - The send record table, late-frame correlation, an uncorrelated frame, and
@@ -646,8 +874,30 @@ The shape:
 
 * Decisions
 
-- 2026-08-24 :: The relay stays the default. The socket path is opt-in until it
-  has carried real traffic. A working setup is not swapped for an untested one.
+- 2026-08-24 :: There is no default transport. The relay and the socket are
+  exclusive modes and one is active at a time.
+- 2026-08-24 :: The first send in a fresh Emacs asks which mode to use.
+- 2026-08-24 :: Switching modes releases what the active mode holds. The switch
+  command offers to do it rather than refusing, except when the coordinator has
+  an unsent paste, which only the user can resolve.
+- 2026-08-24 :: A switch clears the per-context target associations. A choice
+  made under the relay was validated by a model matching a name, and plan 04
+  records that mechanism misrouting.
+- 2026-08-24 :: Socket discovery does not exclude a coordinator pid. In socket
+  mode there is no coordinator.
+- 2026-08-25 :: The mode is remembered permanently. It is picked once, saved,
+  and used by every later Emacs without asking again. Plan 01 keeps target
+  associations in memory because they name a live pid, and a stale pid handle is
+  worse than none. That rule is about resource handles. A mode names no
+  resource. It is a preference and it stays true across restarts, so the rule
+  does not extend to it.
+- 2026-08-25 :: The first-use prompt saves. There is no second question asking
+  permission to remember the answer.
+- 2026-08-25 :: The switch command writes the new mode through to the saved
+  option, so a switch survives a restart.
+- 2026-08-25 :: A saved mode whose resources cannot be acquired fails with an
+  error naming the mode, the missing thing and the switch command. It never
+  falls back to the other mode.
 - 2026-08-24 :: Nothing in the relay path is deleted here. Plan 04's Cleanup
   list is for later.
 - 2026-08-24 :: Discovery reads the session registry. The transcript path and
@@ -690,9 +940,9 @@ The shape:
 - Whether the log file needs rotation, and on what trigger. Nothing in plan 04
   or the code gives a size or an age to base one on, so no threshold is proposed
   here rather than inventing one.
-- Whether the raw frame should stay logged by default once the socket path
-  becomes the default transport. It is recommended on while the transport is
-  opt-in, and that reason expires when the default flips.
+- Whether the raw frame should stay logged once the socket mode has carried real
+  traffic. It is recommended on while the mode is new, and that reason expires
+  when the mode is trusted.
 - Carried over from plan 04, unchanged: whether a =bypassPermissions= target
   holds the message, and whether the relay path has been silently hitting the
   duplicate guard all along.
@@ -702,4 +952,4 @@ The shape:
 - [ ] Settle the receipt socket's lifetime.
 - [ ] Confirm the =from= address encoding against the spike transcript.
 - [ ] Decide whether =--log-message= and =--log-status= may be rewritten.
-- [ ] Start on the transport option and the branch, then the log.
+- [ ] Start on the mode and the branch, then the log.
