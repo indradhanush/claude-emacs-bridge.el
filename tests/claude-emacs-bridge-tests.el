@@ -109,11 +109,21 @@
                         "\"kind\":\"interactive\","
                         "\"sessionId\":\"22222222-2222-2222-2222-222222222222\","
                         "\"name\":\"emacs-server\",\"status\":\"idle\"}]"))
-               0)))
-    (let ((sessions (claude-emacs-bridge--discover-sessions 2)))
+               0))
+            ;; The coordinator's PID now comes from its own vterm process
+            ;; rather than from an argument only a test ever supplied.
+            ((symbol-function 'claude-emacs-bridge--coordinator-pid)
+             (lambda () 2)))
+    (let ((sessions (claude-emacs-bridge--discover-sessions-cli)))
       (should (= (length sessions) 1))
       (should (equal (alist-get 'name (car sessions)) "task-1"))
       (should (= (alist-get 'pid (car sessions)) 1)))))
+
+(ert-deftest claude-emacs-bridge--coordinator-pid-test/nil-without-a-coordinator ()
+  "With no coordinator buffer there is no PID to exclude."
+  (let ((claude-emacs-bridge-buffer-name
+         (generate-new-buffer-name "*claude-emacs-bridge-nopid-test*")))
+    (should-not (claude-emacs-bridge--coordinator-pid))))
 
 (ert-deftest claude-emacs-bridge--discover-sessions-test/rejects-cli-failure ()
   "Discovery reports a failed Claude CLI invocation."
@@ -121,7 +131,7 @@
              (lambda (&rest _)
                (insert "failure")
                1)))
-    (should-error (claude-emacs-bridge--discover-sessions)
+    (should-error (claude-emacs-bridge--discover-sessions-cli)
                   :type 'user-error)))
 
 (ert-deftest claude-emacs-bridge--discover-sessions-test/excludes-background-agents ()
@@ -139,7 +149,7 @@ Background agents have no inbox socket, so the coordinator cannot reach them."
                         "\"sessionId\":\"22222222-2222-2222-2222-222222222222\","
                         "\"name\":\"byohctl-ci-integration\",\"status\":\"idle\"}]"))
                0)))
-    (let ((sessions (claude-emacs-bridge--discover-sessions)))
+    (let ((sessions (claude-emacs-bridge--discover-sessions-cli)))
       (should (= (length sessions) 1))
       (should (equal (alist-get 'name (car sessions)) "task-1")))))
 
@@ -153,7 +163,7 @@ An empty picker is a loud failure; offering an unreachable target is a quiet one
                         "\"sessionId\":\"11111111-1111-1111-1111-111111111111\","
                         "\"name\":\"task-1\",\"status\":\"idle\"}]"))
                0)))
-    (should-not (claude-emacs-bridge--discover-sessions))))
+    (should-not (claude-emacs-bridge--discover-sessions-cli))))
 
 (ert-deftest claude-emacs-bridge--session-label-test/includes-disambiguating-pid ()
   "Picker labels contain the name, PID, status, and cwd."
@@ -857,6 +867,114 @@ can read is a relay that leaks whatever a path in an instruction points at."
            (should (string-match-p "relay" text))
            (should (string-match-p "vterm" text))
            (should (string-match-p "claude-emacs-bridge-switch-transport" text))))))))
+
+;;; Registry discovery
+
+(defun claude-emacs-bridge-tests--registry (rows)
+  "Write ROWS as registry JSON files into a fresh directory and return it.
+Each row is a cons of a basename and a JSON string."
+  (let ((dir (file-name-as-directory (make-temp-file "bridge-registry" t))))
+    (dolist (row rows)
+      (with-temp-file (expand-file-name (car row) dir)
+        (insert (cdr row))))
+    dir))
+
+(defun claude-emacs-bridge-tests--row (&rest overrides)
+  "Return registry JSON for a usable row, with OVERRIDES applied as a plist."
+  (let ((fields (list :pid 101 :name "task-1" :socket 'make
+                      :sessionId "11111111-1111-1111-1111-111111111111"
+                      :cwd "/tmp/one" :status "idle" :startedAt 500)))
+    (while overrides
+      (let ((key (pop overrides)) (value (pop overrides)))
+        (setq fields (plist-put fields key value))))
+    (let ((socket (plist-get fields :socket)))
+      (when (eq socket 'make)
+        (setq socket (make-temp-file "bridge-sock")))
+      (json-encode
+       (append
+        (when (plist-get fields :pid) `((pid . ,(plist-get fields :pid))))
+        (when (plist-get fields :name) `((name . ,(plist-get fields :name))))
+        (when socket `((messagingSocketPath . ,socket)))
+        (when (plist-get fields :sessionId)
+          `((sessionId . ,(plist-get fields :sessionId))))
+        (when (plist-get fields :cwd) `((cwd . ,(plist-get fields :cwd))))
+        `((status . ,(plist-get fields :status))
+          (startedAt . ,(plist-get fields :startedAt))))))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/keeps-a-usable-row ()
+  "A row with a live socket, a name, a pid, a session id and a cwd is a target."
+  (let* ((dir (claude-emacs-bridge-tests--registry
+               (list (cons "101.json" (claude-emacs-bridge-tests--row)))))
+         (claude-emacs-bridge-registry-directory dir)
+         (sessions (claude-emacs-bridge--registry-sessions)))
+    (should (= (length sessions) 1))
+    (should (equal (alist-get 'name (car sessions)) "task-1"))
+    (should (= (alist-get 'pid (car sessions)) 101))
+    (should (alist-get 'startedAt (car sessions)))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/drops-a-row-with-no-socket-path ()
+  "A row that binds no inbox socket cannot be delivered to.
+Same reason the relay path drops background agents."
+  (let* ((dir (claude-emacs-bridge-tests--registry
+               (list (cons "102.json"
+                           (claude-emacs-bridge-tests--row :socket nil)))))
+         (claude-emacs-bridge-registry-directory dir))
+    (should-not (claude-emacs-bridge--registry-sessions))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/drops-a-row-whose-socket-is-gone ()
+  "A session that died leaves its row behind but not its socket."
+  (let* ((dir (claude-emacs-bridge-tests--registry
+               (list (cons "103.json"
+                           (claude-emacs-bridge-tests--row
+                            :socket "/tmp/cc-socks/definitely-not-here.sock")))))
+         (claude-emacs-bridge-registry-directory dir))
+    (should-not (claude-emacs-bridge--registry-sessions))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/drops-a-row-missing-identity ()
+  "A row without a session id or a cwd cannot resolve a transcript later."
+  (let* ((dir (claude-emacs-bridge-tests--registry
+               (list (cons "104.json"
+                           (claude-emacs-bridge-tests--row :sessionId nil))
+                     (cons "105.json"
+                           (claude-emacs-bridge-tests--row :cwd nil))
+                     (cons "106.json"
+                           (claude-emacs-bridge-tests--row :name ""))
+                     (cons "107.json"
+                           (claude-emacs-bridge-tests--row :pid nil)))))
+         (claude-emacs-bridge-registry-directory dir))
+    (should-not (claude-emacs-bridge--registry-sessions))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/survives-unreadable-json ()
+  "One corrupt file does not hide every other session."
+  (let* ((dir (claude-emacs-bridge-tests--registry
+               (list (cons "108.json" "{not json")
+                     (cons "109.json" (claude-emacs-bridge-tests--row)))))
+         (claude-emacs-bridge-registry-directory dir)
+         (sessions (claude-emacs-bridge--registry-sessions)))
+    (should (= (length sessions) 1))))
+
+(ert-deftest claude-emacs-bridge--registry-sessions-test/missing-directory-is-empty ()
+  "A registry directory that does not exist yields no targets rather than an error."
+  (let ((claude-emacs-bridge-registry-directory "/tmp/bridge-no-such-registry/"))
+    (should-not (claude-emacs-bridge--registry-sessions))))
+
+(ert-deftest claude-emacs-bridge--discover-sessions-test/dispatches-on-the-mode ()
+  "Each mode reads its own source, and no caller passes a session list."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (called nil))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--discover-sessions-cli)
+               (lambda () (setq called 'cli) '(cli)))
+              ((symbol-function 'claude-emacs-bridge--registry-sessions)
+               (lambda () (setq called 'registry) '(registry))))
+      (should (equal (claude-emacs-bridge--discover-sessions) '(cli)))
+      (should (eq called 'cli))
+      (setq claude-emacs-bridge--mode 'socket)
+      (should (equal (claude-emacs-bridge--discover-sessions) '(registry)))
+      (should (eq called 'registry)))))
+
+(ert-deftest claude-emacs-bridge--discover-sessions-test/takes-no-arguments ()
+  "The coordinator pid argument is gone; it belonged to the relay branch."
+  (should (equal (func-arity 'claude-emacs-bridge--discover-sessions) '(0 . 0))))
 
 ;;; The log
 

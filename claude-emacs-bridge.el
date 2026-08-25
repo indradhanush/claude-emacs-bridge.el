@@ -35,6 +35,15 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-registry-directory
+  (expand-file-name "~/.claude/sessions/")
+  "Directory holding the per-session registry files Claude Code writes.
+Each file describes one session and carries the fields the socket mode
+needs: the inbox socket path, and the session id and working directory a
+transcript is found from."
+  :type 'directory
+  :group 'claude-emacs-bridge)
+
 (defcustom claude-emacs-bridge-log-frames nil
   "Whether to log the exact bytes written to a target's socket.
 A rendered summary of a frame is built from the same values the frame was,
@@ -164,15 +173,20 @@ the user's own settings say.")
             default-directory)))
    (user-error "Cannot determine a project, workspace, Git root, or directory")))
 
-(defun claude-emacs-bridge--discover-sessions (&optional coordinator-pid)
-  "Return reachable, named Claude sessions other than COORDINATOR-PID.
-Only interactive sessions are returned.  Claude Code also lists background
-agents, which carry a name and sometimes a live PID but have no inbox socket,
-so the coordinator cannot deliver anything to them."
-  (let* ((coordinator (get-buffer claude-emacs-bridge-buffer-name))
-         (process (and coordinator (get-buffer-process coordinator)))
-         (coordinator-pid (or coordinator-pid
-                              (and process (process-id process)))))
+(defun claude-emacs-bridge--coordinator-pid ()
+  "Return the PID of the coordinator's session, or nil when it is not running.
+The coordinator is excluded from its own target list by PID.  Its name is not
+reliable for this: Claude Code renames sessions when names collide."
+  (when-let* ((buffer (get-buffer claude-emacs-bridge-buffer-name))
+              (process (get-buffer-process buffer)))
+    (process-id process)))
+
+(defun claude-emacs-bridge--discover-sessions-cli ()
+  "Return reachable, named Claude sessions, asking the Claude CLI for them.
+The coordinator is excluded by PID.  Only interactive sessions are returned:
+Claude Code also lists background agents, which carry a name and sometimes a
+live PID but have no inbox socket, so nothing can be delivered to them."
+  (let ((coordinator-pid (claude-emacs-bridge--coordinator-pid)))
     (with-temp-buffer
       (let ((status
              (condition-case err
@@ -207,6 +221,53 @@ so the coordinator cannot deliver anything to them."
                     (not (string-empty-p name))
                     (not (equal pid coordinator-pid)))))
            sessions))))))
+
+(defun claude-emacs-bridge--registry-row (file)
+  "Return the session alist in registry FILE, or nil when it is unusable."
+  (condition-case nil
+      (with-temp-buffer
+        (insert-file-contents file)
+        (let* ((row (json-parse-string (buffer-string)
+                                       :object-type 'alist
+                                       :array-type 'list
+                                       :null-object nil
+                                       :false-object nil))
+               (socket (alist-get 'messagingSocketPath row))
+               (name (alist-get 'name row))
+               (pid (alist-get 'pid row)))
+          (when (and (stringp socket)
+                     (not (string-empty-p socket))
+                     ;; A row outlives the session that wrote it.  The socket
+                     ;; going away is the cheapest sign the session has too.
+                     (file-exists-p socket)
+                     (stringp name)
+                     (not (string-empty-p name))
+                     (integerp pid)
+                     (stringp (alist-get 'sessionId row))
+                     (stringp (alist-get 'cwd row)))
+            row)))
+    (error nil)))
+
+(defun claude-emacs-bridge--registry-sessions ()
+  "Return the sessions in `claude-emacs-bridge-registry-directory'.
+A row is kept only when it can actually be delivered to and located later:
+it must name an inbox socket that exists, and carry a name, a PID, a session
+id and a working directory.  A session with no socket is dropped for the same
+reason the CLI path drops background agents."
+  (when (file-directory-p claude-emacs-bridge-registry-directory)
+    (delq nil
+          (mapcar #'claude-emacs-bridge--registry-row
+                  (directory-files
+                   claude-emacs-bridge-registry-directory t "\\.json\\'" t)))))
+
+(defun claude-emacs-bridge--discover-sessions ()
+  "Return the sessions the active delivery mode can reach.
+The two modes read different sources, so the routing lives here and no caller
+has to know which mode is active."
+  (pcase (claude-emacs-bridge--ensure-mode)
+    ('relay (claude-emacs-bridge--discover-sessions-cli))
+    ('socket (claude-emacs-bridge--registry-sessions))
+    (mode (user-error "Unknown delivery mode: %S" mode))))
 
 (defun claude-emacs-bridge--session-label (session)
   "Return a unique picker label for SESSION."
