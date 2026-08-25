@@ -845,6 +845,100 @@ input, which leaves the message sitting unsent in the input box."
             (vterm-send-return))))
       submitted)))
 
+(defun claude-emacs-bridge--holdings (mode)
+  "Return a list naming everything MODE has taken and not given back."
+  (pcase mode
+    ('relay
+     (let ((buffer (get-buffer claude-emacs-bridge-buffer-name)))
+       (when (and buffer
+                  (buffer-local-value 'claude-emacs-bridge--coordinator-p buffer))
+         (list (format "the coordinator session in %s"
+                       claude-emacs-bridge-buffer-name)))))
+    ('socket
+     (append
+      (when (process-live-p claude-emacs-bridge--receipt-process)
+        (list (format "the socket failures are reported on, %s"
+                      (claude-emacs-bridge--receipt-socket-path))))
+      (let ((count (hash-table-count claude-emacs-bridge--sends)))
+        (when (> count 0)
+          (list (format "%d send%s that could still be reported on"
+                        count (if (= count 1) "" "s")))))))))
+
+(defun claude-emacs-bridge--check-releasable (mode)
+  "Signal for anything in MODE that only the user can decide about.
+Checked before anything is confirmed, so nobody agrees to a switch and then
+gets an error instead."
+  (when (eq mode 'relay)
+    (let ((buffer (get-buffer claude-emacs-bridge-buffer-name)))
+      (when (and buffer
+                 (buffer-local-value 'claude-emacs-bridge--coordinator-p buffer)
+                 (claude-emacs-bridge--pending-paste-p buffer))
+        ;; Killing the vterm here would discard a message the user believes
+        ;; was sent, which is the failure the submit recovery exists to stop.
+        (user-error
+         "%s still holds an unsent message; submit or clear it first"
+         claude-emacs-bridge-buffer-name)))))
+
+(defun claude-emacs-bridge--release (mode)
+  "Give back everything MODE has taken."
+  (pcase mode
+    ('relay
+     (let ((buffer (get-buffer claude-emacs-bridge-buffer-name)))
+       ;; Only a buffer this package made.  One with the right name and no
+       ;; flag is a name collision and is never killed.
+       (when (and buffer
+                  (buffer-local-value 'claude-emacs-bridge--coordinator-p buffer))
+         (kill-buffer buffer))))
+    ('socket
+     ;; These can no longer be told about.  Name them rather than let them
+     ;; disappear without trace.
+     (maphash (lambda (id record)
+                (claude-emacs-bridge--log-event
+                 'abandoned
+                 :id id
+                 :target (alist-get 'target record)
+                 :file (alist-get 'file record)
+                 :lines (alist-get 'lines record)))
+              claude-emacs-bridge--sends)
+     (clrhash claude-emacs-bridge--sends)
+     (clrhash claude-emacs-bridge--receipts)
+     (claude-emacs-bridge--release-receipt-socket))))
+
+(defun claude-emacs-bridge-switch-transport (transport)
+  "Change the delivery mode to TRANSPORT, giving back what the old one took.
+The modes are exclusive, so this is the only supported way to move between
+them.  The new mode is saved, or the next restart would undo the switch and
+leave the user back in the old mode with no explanation.
+
+Targets are cleared.  A relay target was chosen so a model could route to it
+by name, and a socket target is a process and a path.  Carrying the first
+across would inherit a choice made under a mechanism known to have misrouted,
+and then deliver to it precisely."
+  (interactive
+   (list (intern (completing-read
+                  "Change delivery mode to: "
+                  (mapcar #'symbol-name claude-emacs-bridge--transports)
+                  nil t))))
+  (unless (memq transport claude-emacs-bridge--transports)
+    (user-error "Unknown delivery mode: %S" transport))
+  (let ((active (claude-emacs-bridge--ensure-mode)))
+    (if (eq transport active)
+        (message "Delivery mode is already %s" active)
+      (claude-emacs-bridge--check-releasable active)
+      (let ((holdings (claude-emacs-bridge--holdings active)))
+        (when (or (null holdings)
+                  (yes-or-no-p
+                   (format "Switching to %s releases %s.  Continue? "
+                           transport (string-join holdings ", and "))))
+          (claude-emacs-bridge--release active)
+          (clrhash claude-emacs-bridge--targets)
+          (setq claude-emacs-bridge--mode transport)
+          (customize-save-variable
+           'claude-emacs-bridge-preferred-transport transport)
+          (claude-emacs-bridge--log-status
+           (format "Delivery mode changed from %s to %s" active transport))
+          (message "Delivery mode is now %s" transport))))))
+
 (defun claude-emacs-bridge-send (beg end instruction)
   "Send the file location from BEG to END to the coordinator.
 Equal endpoints send their current line.  INSTRUCTION tells the target Claude

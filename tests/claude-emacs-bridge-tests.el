@@ -1017,6 +1017,157 @@ can read is a relay that leaks whatever a path in an instruction points at."
     (should (string-match-p (format "%d" (emacs-pid))
                             (claude-emacs-bridge--receipt-socket-path)))))
 
+;;; Switching modes
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/same-mode-does-nothing ()
+  "Switching to the mode already in use releases nothing and saves nothing."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (saved nil))
+    (cl-letf (((symbol-function 'customize-save-variable)
+               (lambda (&rest _) (setq saved t)))
+              ((symbol-function 'yes-or-no-p)
+               (lambda (&rest _) (ert-fail "Nothing to confirm")))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      (claude-emacs-bridge-switch-transport 'relay))
+    (should-not saved)
+    (should (eq claude-emacs-bridge--mode 'relay))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/refuses-while-a-paste-is-pending ()
+  "An unsent message in the coordinator is the user's to resolve, not ours."
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-switch-paste-test*"))
+         (coordinator (generate-new-buffer claude-emacs-bridge-buffer-name)))
+    (unwind-protect
+        (progn
+          (with-current-buffer coordinator
+            (setq-local claude-emacs-bridge--coordinator-p t)
+            (insert "> [5 lines pasted]\n"))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                    ((symbol-function 'customize-save-variable)
+                     (lambda (&rest _) (ert-fail "Must not switch"))))
+            (condition-case err
+                (progn (claude-emacs-bridge-switch-transport 'socket) (should nil))
+              (user-error
+               (should (string-match-p claude-emacs-bridge-buffer-name
+                                       (error-message-string err))))))
+          (should (buffer-live-p coordinator))
+          (should (eq claude-emacs-bridge--mode 'relay)))
+      (when (buffer-live-p coordinator) (kill-buffer coordinator)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/kills-only-a-coordinator-we-made ()
+  "A buffer with the right name and no flag is a collision and is left alone."
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-switch-log-test*"))
+         (claude-emacs-bridge-log-file nil)
+         (claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-switch-collision-test*"))
+         (impostor (generate-new-buffer claude-emacs-bridge-buffer-name))
+         (claude-emacs-bridge--targets (make-hash-table :test 'equal)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                  ((symbol-function 'customize-save-variable) (lambda (&rest _) nil))
+                  ((symbol-function 'message) (lambda (&rest _) nil)))
+          (claude-emacs-bridge-switch-transport 'socket)
+          (should (buffer-live-p impostor))
+          (should (eq claude-emacs-bridge--mode 'socket)))
+      (when (buffer-live-p impostor) (kill-buffer impostor)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/releases-the-coordinator ()
+  "Leaving relay mode ends the session the coordinator was running."
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-switch-log-test*"))
+         (claude-emacs-bridge-log-file nil)
+         (claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-switch-kill-test*"))
+         (coordinator (generate-new-buffer claude-emacs-bridge-buffer-name))
+         (claude-emacs-bridge--targets (make-hash-table :test 'equal)))
+    (with-current-buffer coordinator
+      (setq-local claude-emacs-bridge--coordinator-p t))
+    (puthash '(project . "/tmp/x/") '(1 . 2) claude-emacs-bridge--targets)
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+              ((symbol-function 'customize-save-variable) (lambda (&rest _) nil))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      (claude-emacs-bridge-switch-transport 'socket))
+    (should-not (buffer-live-p coordinator))
+    (should (= (hash-table-count claude-emacs-bridge--targets) 0))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/declining-changes-nothing ()
+  "Saying no leaves the mode and everything it holds alone."
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
+          (generate-new-buffer-name "*claude-emacs-bridge-switch-decline-test*"))
+         (coordinator (generate-new-buffer claude-emacs-bridge-buffer-name)))
+    (unwind-protect
+        (progn
+          (with-current-buffer coordinator
+            (setq-local claude-emacs-bridge--coordinator-p t))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) nil))
+                    ((symbol-function 'customize-save-variable)
+                     (lambda (&rest _) (ert-fail "Must not save")))
+                    ((symbol-function 'message) (lambda (&rest _) nil)))
+            (claude-emacs-bridge-switch-transport 'socket))
+          (should (buffer-live-p coordinator))
+          (should (eq claude-emacs-bridge--mode 'relay)))
+      (when (buffer-live-p coordinator) (kill-buffer coordinator)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/releases-the-receipt-socket ()
+  "Leaving socket mode stops listening and removes the socket file."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((claude-emacs-bridge--mode 'socket)
+          (claude-emacs-bridge--targets (make-hash-table :test 'equal))
+          (path (claude-emacs-bridge--ensure-receipt-socket)))
+      (should (file-exists-p path))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'customize-save-variable) (lambda (&rest _) nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (claude-emacs-bridge-switch-transport 'relay))
+      (should-not (file-exists-p path))
+      (should-not claude-emacs-bridge--receipt-process)
+      (should (eq claude-emacs-bridge--mode 'relay)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/abandoned-sends-are-logged ()
+  "A send that could still have been reported on is named before it is dropped."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((claude-emacs-bridge--mode 'socket)
+          (claude-emacs-bridge--targets (make-hash-table :test 'equal)))
+      (claude-emacs-bridge--remember-send
+       "id-abandoned" '((target . "task-1") (file . "/tmp/example.go")
+                        (lines . "4-7")))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'customize-save-variable) (lambda (&rest _) nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (claude-emacs-bridge-switch-transport 'relay))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (let ((text (buffer-string)))
+          (should (string-match-p "abandoned" text))
+          (should (string-match-p "id=id-abandoned" text))
+          (should (string-match-p "file=/tmp/example.go" text))))
+      (should (= (hash-table-count claude-emacs-bridge--sends) 0)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/saves-the-new-mode ()
+  "A switch survives a restart, or the user lands back where they started."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (claude-emacs-bridge-log-buffer-name
+         (generate-new-buffer-name "*bridge-switch-save-log-test*"))
+        (claude-emacs-bridge-log-file nil)
+        (claude-emacs-bridge--targets (make-hash-table :test 'equal))
+        (saved nil))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+              ((symbol-function 'customize-save-variable)
+               (lambda (symbol value) (setq saved (cons symbol value))))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      (claude-emacs-bridge-switch-transport 'socket))
+    (should (equal saved '(claude-emacs-bridge-preferred-transport . socket)))))
+
+(ert-deftest claude-emacs-bridge-switch-transport-test/rejects-an-unknown-mode ()
+  "Only a mode the bridge knows about can be switched to."
+  (let ((claude-emacs-bridge--mode 'relay))
+    (should-error (claude-emacs-bridge-switch-transport 'telepathy)
+                  :type 'user-error)))
+
 ;;; Reporting the outcome
 
 (ert-deftest claude-emacs-bridge--send-outcome-test/failure-quotes-the-recipient ()
