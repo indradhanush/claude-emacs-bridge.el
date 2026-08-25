@@ -822,11 +822,6 @@ can read is a relay that leaks whatever a path in an instruction points at."
     (should (equal (nth 1 socket-args) "/tmp/example.go"))
     (should (equal (nth 3 socket-args) "Look here."))))
 
-(ert-deftest claude-emacs-bridge--send-via-socket-test/is-not-implemented-yet ()
-  "The socket path refuses clearly while it is a stub."
-  (should-error (claude-emacs-bridge--send-via-socket '(1 . 1) "/tmp/a.go" nil "x")
-                :type 'user-error))
-
 (ert-deftest claude-emacs-bridge-start-test/refuses-in-socket-mode ()
   "Starting the coordinator in socket mode names the active mode and the switch."
   (let ((claude-emacs-bridge--mode 'socket))
@@ -1021,6 +1016,121 @@ can read is a relay that leaks whatever a path in an instruction points at."
   (claude-emacs-bridge-tests--with-receipts
     (should (string-match-p (format "%d" (emacs-pid))
                             (claude-emacs-bridge--receipt-socket-path)))))
+
+;;; Writing to a target socket
+
+(ert-deftest claude-emacs-bridge--write-frame-test/writes-then-closes ()
+  "The frame is written to the target's socket and the connection closed."
+  (let ((opened nil) (written nil) (closed nil))
+    (cl-letf (((symbol-function 'make-network-process)
+               (lambda (&rest args) (setq opened args) 'proc))
+              ((symbol-function 'process-send-string)
+               (lambda (_p text) (setq written text)))
+              ((symbol-function 'process-send-eof) (lambda (_p) nil))
+              ((symbol-function 'delete-process)
+               (lambda (_p) (setq closed t))))
+      (claude-emacs-bridge--write-frame "/tmp/cc-socks/7.sock" "{}\n"))
+    (should (equal (plist-get opened :service) "/tmp/cc-socks/7.sock"))
+    (should (eq (plist-get opened :family) 'local))
+    (should (equal written "{}\n"))
+    (should closed)))
+
+(ert-deftest claude-emacs-bridge--write-frame-test/passes-a-missing-socket-up ()
+  "A socket that cannot be reached raises rather than reporting success."
+  (cl-letf (((symbol-function 'make-network-process)
+             (lambda (&rest _) (signal 'file-error (list "No such file")))))
+    (should-error (claude-emacs-bridge--write-frame "/tmp/cc-socks/gone.sock" "{}\n")
+                  :type 'file-error)))
+
+(ert-deftest claude-emacs-bridge--ensure-receipt-socket-test/missing-directory-explains ()
+  "Without the sockets directory the mode cannot run, and the error says so."
+  (let* ((claude-emacs-bridge--mode 'socket)
+         ;; A path under a temp dir that is created and removed, so the test
+         ;; cannot be fooled by something an earlier run left behind.
+         (parent (file-name-as-directory (make-temp-file "bridge-gone" t)))
+         (claude-emacs-bridge-socket-directory
+          (expand-file-name "cc-socks/" parent))
+         (claude-emacs-bridge--receipt-process nil))
+    (condition-case err
+        (progn (claude-emacs-bridge--ensure-receipt-socket) (should nil))
+      (user-error
+       (let ((text (error-message-string err)))
+         (should (string-match-p "socket" text))
+         (should (string-match-p "cc-socks" text))
+         (should (string-match-p "claude-emacs-bridge-switch-transport" text)))))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/writes-and-reports-unconfirmed ()
+  "A send writes the frame and says plainly that it is not confirmed."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((session '((name . "task-1") (pid . 7) (startedAt . 1)
+                     (messagingSocketPath . "/tmp/cc-socks/7.sock")))
+          (written nil)
+          (shown nil))
+      (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                 (lambda () session))
+                ((symbol-function 'claude-emacs-bridge--write-frame)
+                 (lambda (socket frame) (setq written (cons socket frame))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq shown (apply #'format format-string args)))))
+        (with-temp-buffer
+          (claude-emacs-bridge--send-via-socket
+           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+      (should (equal (car written) "/tmp/cc-socks/7.sock"))
+      (should (string-match-p "\"type\":\"user\"" (cdr written)))
+      (should (string-match-p "Review these lines\\." (cdr written)))
+      (should (string-match-p "unconfirmed" shown))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (let ((text (buffer-string)))
+          (should (string-match-p " send .*transport=socket" text))
+          (should (string-match-p "socket=/tmp/cc-socks/7\\.sock" text))
+          (should (string-match-p " outcome .*result=unconfirmed" text)))))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/remembers-the-send ()
+  "The send is remembered so a later failure report can name what it was about."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((session '((name . "task-1") (pid . 7) (startedAt . 1)
+                     (messagingSocketPath . "/tmp/cc-socks/7.sock"))))
+      (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                 (lambda () session))
+                ((symbol-function 'claude-emacs-bridge--write-frame)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'message) (lambda (&rest _) nil)))
+        (with-temp-buffer
+          (claude-emacs-bridge--send-via-socket
+           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+      (should (= (hash-table-count claude-emacs-bridge--sends) 1))
+      (maphash (lambda (_id record)
+                 (should (equal (alist-get 'file record) "/tmp/example.go"))
+                 (should (equal (alist-get 'lines record) "4-7"))
+                 (should (equal (alist-get 'target record) "task-1"))
+                 ;; No longer waiting: a report arriving now is late.
+                 (should-not (alist-get 'pending record)))
+               claude-emacs-bridge--sends))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/unreachable-socket-is-a-failure ()
+  "A socket that cannot be reached is reported as failure, with the facts."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((session '((name . "task-1") (pid . 7) (startedAt . 1)
+                     (messagingSocketPath . "/tmp/cc-socks/gone.sock")))
+          (shown nil))
+      (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                 (lambda () session))
+                ((symbol-function 'claude-emacs-bridge--write-frame)
+                 (lambda (&rest _) (signal 'file-error (list "Connection refused"))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq shown (apply #'format format-string args)))))
+        (with-temp-buffer
+          (claude-emacs-bridge--send-via-socket
+           '(1 . 2) "/tmp/example.go" (current-buffer) "Look.")))
+      (should (string-match-p "task-1" shown))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (let ((text (buffer-string)))
+          (should (string-match-p " outcome .*result=failed" text))
+          (should (string-match-p "socket=/tmp/cc-socks/gone\\.sock" text))
+          (should (string-match-p "target=task-1" text))
+          (should (string-match-p "Connection refused" text)))))))
 
 ;;; The socket message
 

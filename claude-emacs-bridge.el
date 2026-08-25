@@ -451,7 +451,12 @@ one send would miss the batched drop frame entirely, which does not merely
 lose a report: it makes that failure unobservable."
   (unless (process-live-p claude-emacs-bridge--receipt-process)
     (let ((path (claude-emacs-bridge--receipt-socket-path)))
-      (make-directory claude-emacs-bridge-socket-directory t)
+      ;; The directory belongs to Claude Code.  Creating it would fabricate a
+      ;; namespace nothing is listening in, and an empty picker would be the
+      ;; only symptom.  A missing directory is its own problem, so say so.
+      (unless (file-directory-p claude-emacs-bridge-socket-directory)
+        (claude-emacs-bridge--missing-resource
+         claude-emacs-bridge-socket-directory))
       (when (file-exists-p path)
         (ignore-errors (delete-file path)))
       (setq claude-emacs-bridge--receipt-process
@@ -490,6 +495,12 @@ lose a report: it makes that failure unobservable."
   (claude-emacs-bridge--prune-sends)
   (puthash id (cons (cons 'time (float-time)) record)
            claude-emacs-bridge--sends))
+
+(defun claude-emacs-bridge--finish-send (id)
+  "Mark send ID as no longer waiting for a report of its own.
+A report arriving after this is late, and says so."
+  (when-let ((record (gethash id claude-emacs-bridge--sends)))
+    (puthash id (assq-delete-all 'pending record) claude-emacs-bridge--sends)))
 
 (defun claude-emacs-bridge--parse-receipt (line)
   "Return LINE parsed as a status frame, or nil when it is not one."
@@ -843,11 +854,69 @@ Code session what to do.  Source text is not sent."
                 range file source-buffer instruction))
       (_ (user-error "Unknown delivery mode: %S" mode)))))
 
-(defun claude-emacs-bridge--send-via-socket (_range _file _source-buffer
-                                                    _instruction)
-  "Deliver a file location straight to the target session's inbox socket.
-Not built yet."
-  (user-error "Socket delivery is not implemented yet"))
+(defun claude-emacs-bridge--write-frame (socket frame)
+  "Write FRAME to SOCKET and close.
+Signals a `file-error' when the socket cannot be reached, which plan 04 notes
+is the one failure a sender can detect on the connection itself."
+  (let ((process (make-network-process
+                  :name "claude-emacs-bridge-send"
+                  :family 'local
+                  :service socket
+                  :coding 'utf-8-unix
+                  :noquery t)))
+    (unwind-protect
+        (progn
+          (process-send-string process frame)
+          (process-send-eof process))
+      (ignore-errors (delete-process process)))))
+
+(defun claude-emacs-bridge--send-via-socket (range file source-buffer
+                                                   instruction)
+  "Deliver the location in FILE covered by RANGE to a target's inbox socket.
+SOURCE-BUFFER is where the target is resolved.  INSTRUCTION tells the target
+what to do.  The send is reported as unconfirmed: nothing is written back on
+the connection, so confirmation has to come from elsewhere."
+  (let* ((session (with-current-buffer source-buffer
+                    (claude-emacs-bridge--resolve-target)))
+         (socket (alist-get 'messagingSocketPath session))
+         (target (alist-get 'name session))
+         (lines (format "%d-%d" (car range) (cdr range)))
+         (receipt (claude-emacs-bridge--ensure-receipt-socket))
+         (id (claude-emacs-bridge--uuid))
+         (content (claude-emacs-bridge--socket-content file range instruction))
+         (frame (claude-emacs-bridge--socket-frame
+                 content id (claude-emacs-bridge--uds-address receipt))))
+    (claude-emacs-bridge--log-send
+     id 'socket session file range content socket frame)
+    (claude-emacs-bridge--remember-send
+     id `((transport . socket)
+          (target . ,target)
+          (pid . ,(alist-get 'pid session))
+          (file . ,file)
+          (lines . ,lines)
+          (socket . ,socket)
+          (pending . t)))
+    (condition-case err
+        (progn
+          (claude-emacs-bridge--write-frame socket frame)
+          (claude-emacs-bridge--finish-send id)
+          (claude-emacs-bridge--log-outcome
+           id 'unconfirmed "no confirmation is read yet")
+          (message "Sent to %s: %s lines %s (unconfirmed)" target file lines))
+      (file-error
+       (claude-emacs-bridge--finish-send id)
+       (claude-emacs-bridge--log-outcome
+        id 'failed (error-message-string err))
+       ;; Nothing arrives for this one, so the log entry is the only artifact.
+       (claude-emacs-bridge--log-event
+        'failure
+        :id id
+        :socket socket
+        :target target
+        :pid (alist-get 'pid session)
+        :error (error-message-string err))
+       (message "Could not reach %s at %s: %s"
+                target socket (error-message-string err))))))
 
 (defun claude-emacs-bridge--send-via-relay (range file source-buffer
                                                   instruction)
