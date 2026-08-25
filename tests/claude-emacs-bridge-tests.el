@@ -868,6 +868,80 @@ can read is a relay that leaks whatever a path in an instruction points at."
            (should (string-match-p "vterm" text))
            (should (string-match-p "claude-emacs-bridge-switch-transport" text))))))))
 
+;;; The socket message
+
+(ert-deftest claude-emacs-bridge--socket-content-test/is-three-plain-lines ()
+  "The socket content carries the location and the instruction, nothing else."
+  (should
+   (equal (claude-emacs-bridge--socket-content
+           "/tmp/example.go" '(12 . 40) "Review these lines.")
+          (concat "File: /tmp/example.go\n"
+                  "Lines: 12-40\n"
+                  "Instruction: Review these lines."))))
+
+(ert-deftest claude-emacs-bridge--socket-content-test/carries-no-relay-wrapper ()
+  "Nothing the relay adds for a model to act on is carried over."
+  (let ((content (claude-emacs-bridge--socket-content
+                  "/tmp/example.go" '(1 . 2) "Do the thing.")))
+    (should-not (string-match-p "BEGIN TARGET MESSAGE" content))
+    (should-not (string-match-p "END TARGET MESSAGE" content))
+    (should-not (string-match-p "SendMessage" content))
+    (should-not (string-match-p "@" content))))
+
+(ert-deftest claude-emacs-bridge--socket-content-test/leaves-an-at-path-alone ()
+  "An at-mention reaches the target unescaped.
+Escaping exists because the relay types into an input box.  Nothing is typed
+here, so the two message formats must not quietly converge."
+  (let ((content (claude-emacs-bridge--socket-content
+                  "/tmp/example.go" '(1 . 2)
+                  "inline it into @/tmp/download.sh")))
+    (should (string-match-p "inline it into @/tmp/download\\.sh" content))
+    (should-not (string-match-p "\\\\@" content))))
+
+(ert-deftest claude-emacs-bridge--uds-address-test/prefixes-and-encodes ()
+  "A receipt address is the socket path behind a uds prefix."
+  (let ((address (claude-emacs-bridge--uds-address "/tmp/cc-socks/x.sock")))
+    (should (string-prefix-p "uds:" address))
+    (should (string-match-p "cc-socks" address))))
+
+(ert-deftest claude-emacs-bridge--socket-frame-test/carries-the-required-fields ()
+  "The frame is one JSON object with the fields a recipient reads."
+  (let* ((frame (claude-emacs-bridge--socket-frame
+                 "File: /tmp/a.go\nLines: 1-2\nInstruction: go"
+                 "11111111-1111-4111-8111-111111111111"
+                 "uds:/tmp/cc-socks/r.sock"))
+         (parsed (json-parse-string (string-trim frame)
+                                    :object-type 'alist
+                                    :array-type 'list
+                                    :null-object nil
+                                    :false-object nil)))
+    (should (equal (alist-get 'type parsed) "user"))
+    (should (equal (alist-get 'msgV parsed) 1))
+    (should (equal (alist-get 'msg_id parsed)
+                   "11111111-1111-4111-8111-111111111111"))
+    (should (equal (alist-get 'from parsed) "uds:/tmp/cc-socks/r.sock"))
+    (should (equal (alist-get 'content (alist-get 'message parsed))
+                   "File: /tmp/a.go\nLines: 1-2\nInstruction: go"))))
+
+(ert-deftest claude-emacs-bridge--socket-frame-test/is-one-newline-terminated-line ()
+  "Framing is newline-delimited JSON, so the object holds no raw newline."
+  (let ((frame (claude-emacs-bridge--socket-frame
+                "one\ntwo" "11111111-1111-4111-8111-111111111111" "uds:/x")))
+    (should (string-suffix-p "\n" frame))
+    (should (= (cl-count ?\n frame) 1))))
+
+(ert-deftest claude-emacs-bridge--socket-frame-test/omits-an-absent-from ()
+  "Without a receipt address the field is left out rather than sent empty."
+  (let* ((frame (claude-emacs-bridge--socket-frame
+                 "body" "11111111-1111-4111-8111-111111111111" nil))
+         (parsed (json-parse-string (string-trim frame)
+                                    :object-type 'alist
+                                    :array-type 'list
+                                    :null-object nil
+                                    :false-object nil)))
+    (should-not (alist-get 'from parsed))
+    (should (equal (alist-get 'type parsed) "user"))))
+
 ;;; Registry discovery
 
 (defun claude-emacs-bridge-tests--registry (rows)

@@ -14,6 +14,7 @@
 (require 'json)
 (require 'project)
 (require 'subr-x)
+(require 'url-util)
 
 (defgroup claude-emacs-bridge nil
   "Send file locations to a Claude Code coordinator."
@@ -398,6 +399,37 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
           (alist-get 'name session)
           file start-line end-line
           (claude-emacs-bridge--escape-mentions instruction)))
+
+(defun claude-emacs-bridge--socket-content (file start-end instruction)
+  "Return the text a target receives for FILE over START-END, with INSTRUCTION.
+Nothing wraps it.  The relay has to talk a model into forwarding a payload,
+which is why it needs a preamble and markers.  A socket message is delivered
+by address, so it carries only what the target needs to act on.
+
+At-mentions are deliberately left alone.  `claude-emacs-bridge--escape-mentions'
+exists because the relay types into an input box, where Claude Code turns an
+@path into an attached file before the model runs.  Nothing is typed here."
+  (format "File: %s\nLines: %d-%d\nInstruction: %s"
+          file (car start-end) (cdr start-end) instruction))
+
+(defun claude-emacs-bridge--uds-address (socket)
+  "Return the address a recipient can reach back on, for SOCKET."
+  (concat "uds:" (url-hexify-string socket)))
+
+(defun claude-emacs-bridge--socket-frame (content msg-id from)
+  "Return the frame carrying CONTENT, tagged MSG-ID and answerable at FROM.
+The wire format is newline-delimited JSON, so this is one object and one
+newline.  FROM is optional: without it the recipient has nowhere to report a
+failure, and the send can only ever be confirmed from the target's transcript."
+  (concat
+   (json-encode
+    (append
+     `((type . "user")
+       (msgV . 1)
+       (msg_id . ,msg-id))
+     (when from `((from . ,from)))
+     `((message . ((content . ,content))))))
+   "\n"))
 
 (defun claude-emacs-bridge-list-sessions ()
   "Display active local Claude sessions that can receive bridge messages."
