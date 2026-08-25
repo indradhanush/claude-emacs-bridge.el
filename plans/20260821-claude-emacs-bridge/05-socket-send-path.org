@@ -202,8 +202,9 @@ The branch sits above target resolution, because the two modes resolve targets
 from different sources. The relay mode keeps =claude agents --json=. The socket
 mode reads the registry.
 
-Nothing else in the relay path moves. A reviewer should be able to see that the
-extracted function is a copy.
+In this task the extracted function is a copy, and a reviewer should be able to
+see that. The log task is the only thing that changes it afterwards, when the
+relay path starts recording a send entry and an outcome entry.
 
 * Switching Modes
 
@@ -328,16 +329,36 @@ have died. It is not a full liveness test. A row that survives the filter and
 then fails to connect is the one failure the sender can detect, per plan 04, so
 that case reports a real error rather than a silent success.
 
-Two things are reused as they are:
+Two things are reused as they are, on merit rather than for continuity. A
+stabler key such as =sessionId= was considered and buys nothing here, because a
+switch clears the targets anyway and both modes carry =pid= and =startedAt=.
 
 - =claude-emacs-bridge--session-label= reads =name=, =pid=, =status= and =cwd=.
   The registry rows carry all four.
 - The remembered-target hash keyed on =(pid . startedAt)= works unchanged. The
   registry carries =startedAt=.
 
-So =--read-session= and =--resolve-target= need one change only: where the
-session list comes from. Give =--resolve-target= a session-list argument
-instead of calling =--discover-sessions= itself.
+** One discovery entry point
+
+The two modes read different sources, and four callers need a session list:
+=--resolve-target=, =--read-session= through it,
+=claude-emacs-bridge-list-sessions= and =claude-emacs-bridge-select-session=.
+
+=claude-emacs-bridge--discover-sessions= becomes that entry point. It takes no
+arguments, reads the active mode, and dispatches:
+
+- =relay= :: =--discover-sessions-cli=, which is today's body, =claude agents
+  --json= and the =kind= filter and the coordinator-pid exclusion, moved into a
+  function of its own.
+- =socket= :: =--registry-sessions=.
+
+Every caller keeps its current shape and calls =--discover-sessions=. Mode
+routing lives in one function instead of being repeated at four call sites, and
+no caller has to know which mode is active.
+
+This breaks the current signature, which takes an optional coordinator pid. That
+argument only ever existed so a test could inject one, and it belongs to the
+relay branch now. See the project-level decision on breaking changes.
 
 * Building The Frame
 
@@ -380,8 +401,7 @@ socket case and is reported as a real failure with the path in the message.
 
 * The Receipt Socket
 
-*This section is unresolved and needs Dhanush's call.* Plan 04 lists it as an
-open question and nothing since has settled it.
+Plan 04 left this open. It is settled now: Option B below.
 
 The receipt socket is how a failure reaches Emacs. The target opens a fresh
 connection to the address in =from= and writes one frame. Plan 04 verified that
@@ -430,9 +450,9 @@ Confirm from the transcript alone.
 - Ruled out. A send has to be able to report the recipient's own reason string,
   and that only arrives on the receipt socket.
 
-** Recommendation
+** The decision: Option B
 
-Option B. The deciding fact is the batched drop frame. A per-send socket cannot
+Settled on 2026-08-25. The deciding fact is the batched drop frame. A per-send socket cannot
 receive it at all, and duplicate drops are the failure most likely to happen in
 normal use. Everything else is a wash, and the stale-file problem is easier
 with a pid-derived name than with a name per send.
@@ -729,8 +749,8 @@ missing errors naming the mode, the missing thing and the switch command.
 ** TODO Build the log
 Add =--log-event=, the send id, =claude-emacs-bridge-log-frames=, the file sink
 option and =claude-emacs-bridge-show-log=. Rewrite =--log-message= and
-=--log-status= to call =--log-event=, and update the two tests that assert their
-old text. Have the relay path record a send entry and an outcome entry.
+=--log-status= to call =--log-event=, and rewrite the two tests that assert
+their old text. Have the relay path record a send entry and an outcome entry.
 
 This lands second on purpose. Every slice after it is easier to debug because
 it exists, and the relay path gets the benefit immediately even though the
@@ -742,12 +762,14 @@ and does nothing when it is nil, and that the show command pops the buffer.
 
 ** TODO Read targets from the session registry
 Add =claude-emacs-bridge-registry-directory= and
-=--registry-sessions=. Give =--resolve-target= a session-list argument, and
-route =claude-emacs-bridge-list-sessions= and
-=claude-emacs-bridge-select-session= by mode. Test the filter against fixture
-JSON files in a temp directory, covering a row with no =messagingSocketPath=, a
-row whose socket file is gone, a row missing =sessionId= or =cwd=, and a good
-row. Test that each mode reads its own source.
+=--registry-sessions=. Move today's =--discover-sessions= body into
+=--discover-sessions-cli= and make =--discover-sessions= dispatch on the mode
+with no arguments. Update its existing tests to the new signature.
+
+Test the filter against fixture JSON files in a temp directory, covering a row
+with no =messagingSocketPath=, a row whose socket file is gone, a row missing
+=sessionId= or =cwd=, and a good row. Test that each mode dispatches to its own
+source and that no caller passes a session list.
 
 ** TODO Build the message content and the frame
 Add =--socket-content=, =--socket-frame= and =--uuid=. Test the content shape,
@@ -764,8 +786,6 @@ Add =--sends= and the late-frame path: a frame arriving after the send returned
 is joined to its record, logged as late, and shown once. Test a late frame
 against a live record, a frame with no matching record logged as uncorrelated,
 and a record dropped once it is older than the sixty-second window.
-
-*Blocked on the receipt socket decision.*
 
 ** TODO Write the frame, reporting unconfirmed always
 Add =--write-frame= and have =--send-via-socket= resolve a target, build the
@@ -811,13 +831,15 @@ are done.
 
 * Testing
 
-The suite currently runs 56 tests and must keep passing untouched. New tests
-add on top. Every helper introduced here gets a direct ERT test, matching the
-convention already in =CLAUDE.md=.
+The suite currently runs 56 tests. Every helper introduced here gets a direct
+ERT test, matching the convention already in =CLAUDE.md=.
 
-The one exception is the two tests that assert the old =--log-message= and
-=--log-status= text. Those change when the log format changes. Everything else
-stays as it is.
+Tests that assert behaviour this plan changes are rewritten with it. The two
+asserting the old =--log-message= and =--log-status= text change because the log
+format changes, and the =--discover-sessions= tests change because its signature
+does. A test that encodes an old interface is not evidence of a regression, and
+the suite is judged on whether it passes after the change, not on whether it was
+left alone.
 
 ** What fakes cover
 
@@ -898,6 +920,21 @@ The shape:
 - 2026-08-25 :: A saved mode whose resources cannot be acquired fails with an
   error naming the mode, the missing thing and the switch command. It never
   falls back to the other mode.
+- 2026-08-25 :: The receipt socket is Option B. One socket per Emacs process,
+  bound lazily on the first socket send, named from the Emacs pid, kept for the
+  Emacs lifetime, correlated by =msg_id=. A per-send socket is unlinked long
+  before plan 04's batched drop frames arrive, and it does not merely fail to
+  report that class of failure. It makes it unobservable.
+- 2026-08-25 :: Breaking interfaces is allowed. The project is work in progress
+  and nothing outside it depends on these names or signatures, so a design is
+  judged on whether it is the right shape and not on whether it preserves an
+  existing one. Tests that assert changed behaviour are rewritten with it.
+
+  This permits breaking interfaces. It does not permit widening scope. The relay
+  path is not deleted and none of plan 04's Cleanup happens early.
+- 2026-08-25 :: =--discover-sessions= dispatches on the mode and takes no
+  arguments. Threading a session list through its callers was the smaller
+  disturbance, not the better shape.
 - 2026-08-24 :: Nothing in the relay path is deleted here. Plan 04's Cleanup
   list is for later.
 - 2026-08-24 :: Discovery reads the session registry. The transcript path and
@@ -921,9 +958,9 @@ The shape:
 
 * Open Questions
 
-- What owns the receipt socket's lifetime. Option B, one socket per Emacs
-  process, is the recommendation above, on the strength of the batched drop
-  frame. Needs Dhanush's call before that task starts.
+None of these blocks starting. Each is answerable inside the task that needs it,
+and none changes the shape of the design.
+
 - The exact percent-encoding used in the =from= address. Plan 04 records that a
   percent-encoded socket path was accepted live. The escaping set that spike
   used should be confirmed against its transcript before the frame builder is
@@ -931,12 +968,6 @@ The shape:
 - Whether the socket path should subscribe to =notify_when_idle=. Plan 04
   documents the mechanism and its sharp edge, but nothing in the three outcomes
   needs it. Left out of this plan on purpose.
-- Whether rewriting =--log-message= and =--log-status= is acceptable. It changes
-  the text of a shipped function and two existing tests assert that text. The
-  alternative is to keep both producing their current output and add
-  =--log-event= alongside, which leaves two formats in one buffer and makes it
-  unsearchable. The recommendation is the rewrite. Needs Dhanush's call, because
-  it is the only place this plan changes an existing test.
 - Whether the log file needs rotation, and on what trigger. Nothing in plan 04
   or the code gives a size or an age to base one on, so no threshold is proposed
   here rather than inventing one.
@@ -949,7 +980,12 @@ The shape:
 
 * Next Steps
 
-- [ ] Settle the receipt socket's lifetime.
-- [ ] Confirm the =from= address encoding against the spike transcript.
-- [ ] Decide whether =--log-message= and =--log-status= may be rewritten.
-- [ ] Start on the mode and the branch, then the log.
+Design is done. Every question that blocked implementation is answered: the mode
+model, the mode's persistence, the receipt socket's lifetime, and the licence to
+break interfaces. What remains is the first task, not more design.
+
+- [ ] Start on the mode, the first-use prompt and the branch.
+- [ ] Then the log, before anything else, so every later slice is debuggable.
+
+The remaining open questions are answerable inside the task that needs them.
+None of them holds up the first task.
