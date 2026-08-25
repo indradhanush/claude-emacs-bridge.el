@@ -36,6 +36,14 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-socket-directory "/tmp/cc-socks/"
+  "Directory holding Claude Code's inbox sockets.
+The bridge binds its own receipt socket here.  A recipient checks that a
+reach-back address lives in this directory before connecting to it, so the
+socket cannot be put anywhere more private.  The filename is ours to choose."
+  :type 'directory
+  :group 'claude-emacs-bridge)
+
 (defcustom claude-emacs-bridge-registry-directory
   (expand-file-name "~/.claude/sessions/")
   "Directory holding the per-session registry files Claude Code writes.
@@ -399,6 +407,149 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
           (alist-get 'name session)
           file start-line end-line
           (claude-emacs-bridge--escape-mentions instruction)))
+
+(defconst claude-emacs-bridge--send-record-ttl 60
+  "Seconds a send is remembered for, so a late frame can still name it.
+Plan 04 measured the recipient reporting further drops in a sixty-second
+window, batched about five seconds behind.  Nothing is expected after that.")
+
+(defvar claude-emacs-bridge--sends (make-hash-table :test 'equal)
+  "Sends this Emacs has made, keyed by message id.
+A failure can be reported seconds after a send gave up waiting, so the record
+outlives the send and lets a late frame name the file and lines it concerns
+instead of only an id.")
+
+(defvar claude-emacs-bridge--receipts (make-hash-table :test 'equal)
+  "Frames that arrived while their send was still waiting for one.")
+
+(defvar claude-emacs-bridge--receipt-process nil
+  "The listening socket failures are reported back on, or nil.")
+
+(defun claude-emacs-bridge--receipt-socket-path ()
+  "Return the path this Emacs listens for failure reports on.
+The name carries the Emacs PID, so a file already at this path was left by a
+process that is gone and can be replaced without asking."
+  (expand-file-name (format "emacs-bridge-%d.sock" (emacs-pid))
+                    claude-emacs-bridge-socket-directory))
+
+(defun claude-emacs-bridge--receipt-filter (process output)
+  "Handle OUTPUT arriving on the receipt socket PROCESS.
+Frames are newline-delimited, and a read can split one, so a partial line is
+kept until its newline arrives."
+  (let ((buffered (concat (or (process-get process 'partial) "") output)))
+    (while (string-match "\\`\\([^\n]*\\)\n" buffered)
+      (let ((line (match-string 1 buffered)))
+        (setq buffered (substring buffered (match-end 0)))
+        (when-let ((frame (claude-emacs-bridge--parse-receipt line)))
+          (claude-emacs-bridge--handle-receipt frame))))
+    (process-put process 'partial buffered)))
+
+(defun claude-emacs-bridge--ensure-receipt-socket ()
+  "Return the receipt socket path, binding the socket when it is not up yet.
+Bound once and kept for the life of this Emacs.  A socket that only lived for
+one send would miss the batched drop frame entirely, which does not merely
+lose a report: it makes that failure unobservable."
+  (unless (process-live-p claude-emacs-bridge--receipt-process)
+    (let ((path (claude-emacs-bridge--receipt-socket-path)))
+      (make-directory claude-emacs-bridge-socket-directory t)
+      (when (file-exists-p path)
+        (ignore-errors (delete-file path)))
+      (setq claude-emacs-bridge--receipt-process
+            (make-network-process
+             :name "claude-emacs-bridge-receipts"
+             :server t
+             :family 'local
+             :service path
+             :coding 'utf-8-unix
+             :noquery t
+             :filter #'claude-emacs-bridge--receipt-filter
+             :log (lambda (&rest _) nil)))
+      (add-hook 'kill-emacs-hook
+                #'claude-emacs-bridge--release-receipt-socket)))
+  (claude-emacs-bridge--receipt-socket-path))
+
+(defun claude-emacs-bridge--release-receipt-socket ()
+  "Stop listening for failure reports and remove the socket file."
+  (when claude-emacs-bridge--receipt-process
+    (ignore-errors (delete-process claude-emacs-bridge--receipt-process))
+    (setq claude-emacs-bridge--receipt-process nil))
+  (let ((path (claude-emacs-bridge--receipt-socket-path)))
+    (when (file-exists-p path)
+      (ignore-errors (delete-file path)))))
+
+(defun claude-emacs-bridge--prune-sends ()
+  "Forget sends older than `claude-emacs-bridge--send-record-ttl'."
+  (let ((cutoff (- (float-time) claude-emacs-bridge--send-record-ttl)))
+    (maphash (lambda (id record)
+               (when (< (or (alist-get 'time record) 0) cutoff)
+                 (remhash id claude-emacs-bridge--sends)))
+             claude-emacs-bridge--sends)))
+
+(defun claude-emacs-bridge--remember-send (id record)
+  "Remember RECORD under send ID so a late frame can name what it concerns."
+  (claude-emacs-bridge--prune-sends)
+  (puthash id (cons (cons 'time (float-time)) record)
+           claude-emacs-bridge--sends))
+
+(defun claude-emacs-bridge--parse-receipt (line)
+  "Return LINE parsed as a status frame, or nil when it is not one."
+  (when (and (stringp line) (not (string-empty-p (string-trim line))))
+    (condition-case nil
+        (let ((frame (json-parse-string line
+                                        :object-type 'alist
+                                        :array-type 'list
+                                        :null-object nil
+                                        :false-object nil)))
+          ;; A JSON array parses to a list of scalars, so an object is
+          ;; recognised by its first element being a key and value pair.
+          (and (consp frame)
+               (consp (car frame))
+               (stringp (alist-get 'status frame))
+               frame))
+      (error nil))))
+
+(defun claude-emacs-bridge--receipt-reason (frame)
+  "Return the text FRAME gives for what happened, written for a human."
+  (or (alist-get 'reason frame)
+      (alist-get 'status_detail frame)
+      (alist-get 'drop_reason frame)
+      (alist-get 'status frame)))
+
+(defun claude-emacs-bridge--handle-receipt (frame)
+  "Record FRAME, and say so when it arrives too late for its send to report it."
+  (let* ((id (alist-get 'orig_msg_id frame))
+         (record (and id (gethash id claude-emacs-bridge--sends))))
+    (cond
+     ;; Still waiting: the send reports this itself, in its own outcome.
+     ((alist-get 'pending record)
+      (puthash id frame claude-emacs-bridge--receipts))
+     (record
+      (claude-emacs-bridge--log-event
+       'receipt
+       :id id
+       :late "yes"
+       :status (alist-get 'status frame)
+       :status_detail (alist-get 'status_detail frame)
+       :drop_reason (alist-get 'drop_reason frame)
+       :target (alist-get 'target record)
+       :file (alist-get 'file record)
+       :lines (alist-get 'lines record)
+       :reason (alist-get 'reason frame))
+      ;; A send that already said unconfirmed has no other way to correct
+      ;; itself, so this is worth one line in the echo area.
+      (message "Bridge: %s %s lines %s: %s"
+               (alist-get 'status frame)
+               (alist-get 'file record)
+               (alist-get 'lines record)
+               (claude-emacs-bridge--receipt-reason frame)))
+     (t
+      ;; An unknown frame is the evidence for a failure nobody has seen yet.
+      (claude-emacs-bridge--log-event
+       'receipt
+       :uncorrelated "yes"
+       :id id
+       :status (alist-get 'status frame)
+       :frame (json-encode frame))))))
 
 (defun claude-emacs-bridge--socket-content (file start-end instruction)
   "Return the text a target receives for FILE over START-END, with INSTRUCTION.

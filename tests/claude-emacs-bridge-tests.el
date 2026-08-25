@@ -868,6 +868,160 @@ can read is a relay that leaks whatever a path in an instruction points at."
            (should (string-match-p "vterm" text))
            (should (string-match-p "claude-emacs-bridge-switch-transport" text))))))))
 
+;;; The receipt socket
+
+(defmacro claude-emacs-bridge-tests--with-receipts (&rest body)
+  "Run BODY with a clean log, send table and socket directory."
+  (declare (indent 0))
+  `(let* ((claude-emacs-bridge-log-buffer-name
+           (generate-new-buffer-name "*bridge-receipt-log-test*"))
+          (claude-emacs-bridge-log-file nil)
+          (claude-emacs-bridge-socket-directory
+           (file-name-as-directory (make-temp-file "bridge-socks" t)))
+          (claude-emacs-bridge--sends (make-hash-table :test 'equal))
+          (claude-emacs-bridge--receipts (make-hash-table :test 'equal))
+          (claude-emacs-bridge--receipt-process nil))
+     (unwind-protect (progn ,@body)
+       (claude-emacs-bridge--release-receipt-socket)
+       (when (get-buffer claude-emacs-bridge-log-buffer-name)
+         (kill-buffer claude-emacs-bridge-log-buffer-name)))))
+
+(defun claude-emacs-bridge-tests--status-frame (id status &rest extra)
+  "Return a status frame line for ID with STATUS and EXTRA fields."
+  (concat (json-encode
+           (append `((type . "control")
+                     (action . "peer_message_status")
+                     (status . ,status)
+                     (orig_msg_id . ,id)
+                     (msgV . 1))
+                   extra))
+          "\n"))
+
+(ert-deftest claude-emacs-bridge--parse-receipt-test/reads-a-held-frame ()
+  "A held frame yields its status and the reason written for a human."
+  (let ((frame (claude-emacs-bridge--parse-receipt
+                (claude-emacs-bridge-tests--status-frame
+                 "id-1" "held" '(reason . "waiting for approval")))))
+    (should (equal (alist-get 'status frame) "held"))
+    (should (equal (alist-get 'orig_msg_id frame) "id-1"))
+    (should (equal (alist-get 'reason frame) "waiting for approval"))))
+
+(ert-deftest claude-emacs-bridge--parse-receipt-test/reads-a-refused-frame ()
+  "A refusal arrives as expired with the detail saying why."
+  (let ((frame (claude-emacs-bridge--parse-receipt
+                (claude-emacs-bridge-tests--status-frame
+                 "id-2" "expired" '(status_detail . "refused")))))
+    (should (equal (alist-get 'status frame) "expired"))
+    (should (equal (alist-get 'status_detail frame) "refused"))))
+
+(ert-deftest claude-emacs-bridge--parse-receipt-test/reads-a-dropped-frame ()
+  "A drop carries the reason it was dropped for."
+  (let ((frame (claude-emacs-bridge--parse-receipt
+                (claude-emacs-bridge-tests--status-frame
+                 "id-3" "dropped" '(drop_reason . "duplicate")))))
+    (should (equal (alist-get 'status frame) "dropped"))
+    (should (equal (alist-get 'drop_reason frame) "duplicate"))))
+
+(ert-deftest claude-emacs-bridge--parse-receipt-test/rejects-unparseable-bytes ()
+  "Garbage on the socket is not a frame and must not raise."
+  (should-not (claude-emacs-bridge--parse-receipt "not json at all"))
+  (should-not (claude-emacs-bridge--parse-receipt ""))
+  (should-not (claude-emacs-bridge--parse-receipt "[1,2,3]")))
+
+(ert-deftest claude-emacs-bridge--handle-receipt-test/late-frame-names-its-send ()
+  "A frame arriving after the send returned names the file and lines it is about."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((shown nil))
+      (claude-emacs-bridge--remember-send
+       "id-4" '((transport . socket) (target . "task-1") (pid . 7)
+                (file . "/tmp/example.go") (lines . "4-7")))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq shown (apply #'format format-string args)))))
+        (claude-emacs-bridge--handle-receipt
+         (claude-emacs-bridge--parse-receipt
+          (claude-emacs-bridge-tests--status-frame
+           "id-4" "dropped" '(drop_reason . "duplicate")
+           '(reason . "the recipient dropped your message")))))
+      (with-current-buffer claude-emacs-bridge-log-buffer-name
+        (let ((text (buffer-string)))
+          (should (string-match-p "receipt" text))
+          (should (string-match-p "late=yes" text))
+          (should (string-match-p "id=id-4" text))
+          (should (string-match-p "status=dropped" text))
+          (should (string-match-p "drop_reason=duplicate" text))
+          (should (string-match-p "file=/tmp/example.go" text))
+          (should (string-match-p "lines=4-7" text))))
+      (should shown)
+      (should (string-match-p "/tmp/example.go" shown)))))
+
+(ert-deftest claude-emacs-bridge--handle-receipt-test/waiting-send-is-not-late ()
+  "A frame that arrives while the send is still waiting is left for it."
+  (claude-emacs-bridge-tests--with-receipts
+    (claude-emacs-bridge--remember-send
+     "id-5" '((transport . socket) (target . "task-1") (pid . 7)
+              (file . "/tmp/a.go") (lines . "1-1") (pending . t)))
+    (cl-letf (((symbol-function 'message)
+               (lambda (&rest _) (ert-fail "A waiting send reports for itself"))))
+      (claude-emacs-bridge--handle-receipt
+       (claude-emacs-bridge--parse-receipt
+        (claude-emacs-bridge-tests--status-frame "id-5" "held"))))
+    (should (gethash "id-5" claude-emacs-bridge--receipts))
+    ;; Nothing is logged either: the send reports this in its own outcome.
+    (should-not (get-buffer claude-emacs-bridge-log-buffer-name))))
+
+(ert-deftest claude-emacs-bridge--handle-receipt-test/unknown-id-is-kept-verbatim ()
+  "A frame matching no send is still evidence and is logged in full."
+  (claude-emacs-bridge-tests--with-receipts
+    (cl-letf (((symbol-function 'message) (lambda (&rest _) nil)))
+      (claude-emacs-bridge--handle-receipt
+       (claude-emacs-bridge--parse-receipt
+        (claude-emacs-bridge-tests--status-frame "id-nobody" "held"))))
+    (with-current-buffer claude-emacs-bridge-log-buffer-name
+      (let ((text (buffer-string)))
+        (should (string-match-p "uncorrelated=yes" text))
+        (should (string-match-p "id-nobody" text))))))
+
+(ert-deftest claude-emacs-bridge--prune-sends-test/drops-records-past-the-window ()
+  "A record older than the drop-reporting window is forgotten."
+  (claude-emacs-bridge-tests--with-receipts
+    (claude-emacs-bridge--remember-send "fresh" '((file . "/tmp/a.go")))
+    (puthash "stale"
+             (cons (cons 'time (- (float-time)
+                                  (* 2 claude-emacs-bridge--send-record-ttl)))
+                   '((file . "/tmp/b.go")))
+             claude-emacs-bridge--sends)
+    (claude-emacs-bridge--prune-sends)
+    (should (gethash "fresh" claude-emacs-bridge--sends))
+    (should-not (gethash "stale" claude-emacs-bridge--sends))))
+
+(ert-deftest claude-emacs-bridge--receipt-socket-test/binds-over-a-stale-file ()
+  "A file left at our own path came from a dead Emacs and is replaced."
+  (claude-emacs-bridge-tests--with-receipts
+    (let ((path (claude-emacs-bridge--receipt-socket-path)))
+      (with-temp-file path (insert "left behind"))
+      (should (file-exists-p path))
+      (should (equal (claude-emacs-bridge--ensure-receipt-socket) path))
+      (should (process-live-p claude-emacs-bridge--receipt-process)))))
+
+(ert-deftest claude-emacs-bridge--receipt-socket-test/binds-once-and-releases ()
+  "The socket is bound lazily, reused, and cleaned up with its file."
+  (claude-emacs-bridge-tests--with-receipts
+    (let* ((path (claude-emacs-bridge--ensure-receipt-socket))
+           (process claude-emacs-bridge--receipt-process))
+      (should (file-exists-p path))
+      (should (eq process (progn (claude-emacs-bridge--ensure-receipt-socket)
+                                 claude-emacs-bridge--receipt-process)))
+      (claude-emacs-bridge--release-receipt-socket)
+      (should-not claude-emacs-bridge--receipt-process)
+      (should-not (file-exists-p path)))))
+
+(ert-deftest claude-emacs-bridge--receipt-socket-test/path-carries-the-emacs-pid ()
+  "The name identifies this Emacs, so a leftover file is provably from a dead one."
+  (claude-emacs-bridge-tests--with-receipts
+    (should (string-match-p (format "%d" (emacs-pid))
+                            (claude-emacs-bridge--receipt-socket-path)))))
+
 ;;; The socket message
 
 (ert-deftest claude-emacs-bridge--socket-content-test/is-three-plain-lines ()
