@@ -35,6 +35,26 @@
   :type 'string
   :group 'claude-emacs-bridge)
 
+(defcustom claude-emacs-bridge-preferred-transport nil
+  "The remembered delivery mode, `relay', `socket', or nil.
+This is what survives a restart.  It is nil until the first send asks, and
+that answer is saved here.  Change it with
+`claude-emacs-bridge-switch-transport' rather than by editing it, so the
+resources the active mode holds are released first."
+  :type '(choice (const :tag "Not chosen yet" nil)
+                 (const :tag "Relay through a coordinator session" relay)
+                 (const :tag "Straight to the target's inbox socket" socket))
+  :group 'claude-emacs-bridge)
+
+(defconst claude-emacs-bridge--transports '(relay socket)
+  "The delivery modes the bridge knows about.")
+
+(defvar claude-emacs-bridge--mode nil
+  "The delivery mode in use right now, or nil when none is bound.
+Separate from `claude-emacs-bridge-preferred-transport' on purpose.  This
+says what is bound; the option says what was chosen.  Setting an option
+cannot release a coordinator vterm, so the two cannot be one variable.")
+
 (defcustom claude-emacs-bridge-paste-placeholder-regexp
   "\\[[^]\n]*pasted[^]\n]*\\]"
   "Regexp matching the collapsed paste Claude Code shows for unsent input.
@@ -209,6 +229,55 @@ so the coordinator cannot deliver anything to them."
                    claude-emacs-bridge--targets)
           session))))
 
+(defun claude-emacs-bridge--read-transport ()
+  "Prompt for a delivery mode and return it as a symbol."
+  (intern
+   (completing-read
+    (concat "Delivery mode"
+            " (relay: a Claude session in a terminal you can watch;"
+            " socket: straight to the target, no terminal)."
+            " Remembered; change it later with"
+            " claude-emacs-bridge-switch-transport: ")
+    (mapcar #'symbol-name claude-emacs-bridge--transports)
+    nil t)))
+
+(defun claude-emacs-bridge--ensure-mode ()
+  "Return the active delivery mode, choosing one when nothing is chosen yet.
+An already running mode wins.  Otherwise the remembered choice seeds it.
+Otherwise ask, and remember the answer: the question is asked once in the
+life of a configuration."
+  (or claude-emacs-bridge--mode
+      (setq claude-emacs-bridge--mode
+            (let ((saved claude-emacs-bridge-preferred-transport))
+              (if (memq saved claude-emacs-bridge--transports)
+                  saved
+                (when saved
+                  (message
+                   "Ignoring unrecognized saved delivery mode %S; asking again"
+                   saved))
+                (let ((chosen (claude-emacs-bridge--read-transport)))
+                  (customize-save-variable
+                   'claude-emacs-bridge-preferred-transport chosen)
+                  chosen))))))
+
+(defun claude-emacs-bridge--require-mode (wanted command)
+  "Signal unless WANTED is the active delivery mode.
+COMMAND names the caller.  The message names the active mode, because the
+mode is global state that changes what commands do."
+  (let ((active (claude-emacs-bridge--ensure-mode)))
+    (unless (eq active wanted)
+      (user-error
+       "%s belongs to %s mode, but %s mode is active; change it with %s"
+       command wanted active "claude-emacs-bridge-switch-transport"))
+    active))
+
+(defun claude-emacs-bridge--missing-resource (missing)
+  "Signal that the active mode cannot run because MISSING is unavailable."
+  (user-error
+   "%s mode is active but %s is unavailable; change it with %s"
+   claude-emacs-bridge--mode missing
+   "claude-emacs-bridge-switch-transport"))
+
 (defun claude-emacs-bridge--line-range (beg end)
   "Return the inclusive line range from BEG to END.
 When BEG and END are equal, return the line containing that position."
@@ -252,6 +321,7 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
 (defun claude-emacs-bridge-list-sessions ()
   "Display active local Claude sessions that can receive bridge messages."
   (interactive)
+  (claude-emacs-bridge--ensure-mode)
   (let ((sessions (claude-emacs-bridge--discover-sessions))
         (buffer (get-buffer-create "*Claude Sessions*")))
     (with-current-buffer buffer
@@ -269,6 +339,7 @@ START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
 (defun claude-emacs-bridge-select-session ()
   "Replace the Claude target associated with the current context."
   (interactive)
+  (claude-emacs-bridge--ensure-mode)
   (let* ((key (claude-emacs-bridge--context-key))
          (session
           (claude-emacs-bridge--read-session
@@ -330,6 +401,7 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
 (defun claude-emacs-bridge-start ()
   "Start or display the dedicated Claude Code coordinator vterm."
   (interactive)
+  (claude-emacs-bridge--require-mode 'relay "claude-emacs-bridge-start")
   (let ((buffer (get-buffer claude-emacs-bridge-buffer-name)))
     (cond
      ((and buffer
@@ -349,7 +421,9 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
                   claude-emacs-bridge-buffer-name)))
     (unless buffer
       (unless (fboundp 'vterm)
-        (require 'vterm))
+        (condition-case nil
+            (require 'vterm)
+          (error (claude-emacs-bridge--missing-resource "vterm"))))
       (setq buffer (vterm claude-emacs-bridge-buffer-name))
       (with-current-buffer buffer
         (setq-local claude-emacs-bridge--coordinator-p t)
@@ -360,6 +434,7 @@ FILE, START-LINE, END-LINE, and INSTRUCTION describe the message."
 (defun claude-emacs-bridge-clear ()
   "Send /clear to the Claude Code coordinator session."
   (interactive)
+  (claude-emacs-bridge--require-mode 'relay "claude-emacs-bridge-clear")
   (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
     (with-current-buffer coordinator
       (vterm-send-string "/clear")
@@ -422,37 +497,58 @@ Code session what to do.  Source text is not sent."
   (when (or (not (stringp instruction))
             (string-empty-p (string-trim instruction)))
     (user-error "Instruction cannot be empty"))
-  (let ((range (claude-emacs-bridge--line-range beg end))
-        (file (expand-file-name buffer-file-name))
-        (source-buffer (current-buffer)))
-    (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
-      (let* ((session
-              (with-current-buffer source-buffer
-                (claude-emacs-bridge--resolve-target)))
-             (prompt
-              (claude-emacs-bridge--format-prompt
-               session
-               file
-               (car range)
-               (cdr range)
-               instruction)))
-        (with-current-buffer coordinator
-          (vterm-send-string prompt t)
-          (vterm-send-return))
-        (claude-emacs-bridge--log-message
-         session file (car range) (cdr range) instruction)
-        (if (claude-emacs-bridge--await-submit coordinator)
-            (message "Sent to %s: %s lines %d-%d"
-                     (alist-get 'name session)
-                     file
-                     (car range)
-                     (cdr range))
-          (let ((warning
-                 (format "Message to %s may not have been submitted; check %s"
-                         (alist-get 'name session)
-                         claude-emacs-bridge-buffer-name)))
-            (claude-emacs-bridge--log-status warning)
-            (message "%s" warning)))))))
+  ;; The mode is settled before the range is measured and before any target
+  ;; is resolved, so nobody picks a target for a mode they have not chosen.
+  (let* ((mode (claude-emacs-bridge--ensure-mode))
+         (range (claude-emacs-bridge--line-range beg end))
+         (file (expand-file-name buffer-file-name))
+         (source-buffer (current-buffer)))
+    (pcase mode
+      ('relay (claude-emacs-bridge--send-via-relay
+               range file source-buffer instruction))
+      ('socket (claude-emacs-bridge--send-via-socket
+                range file source-buffer instruction))
+      (_ (user-error "Unknown delivery mode: %S" mode)))))
+
+(defun claude-emacs-bridge--send-via-socket (_range _file _source-buffer
+                                                    _instruction)
+  "Deliver a file location straight to the target session's inbox socket.
+Not built yet."
+  (user-error "Socket delivery is not implemented yet"))
+
+(defun claude-emacs-bridge--send-via-relay (range file source-buffer
+                                                  instruction)
+  "Send the location in FILE covered by RANGE through the coordinator.
+SOURCE-BUFFER is the buffer the range came from, and it is where the target
+is resolved.  INSTRUCTION tells the target session what to do."
+  (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
+    (let* ((session
+            (with-current-buffer source-buffer
+              (claude-emacs-bridge--resolve-target)))
+           (prompt
+            (claude-emacs-bridge--format-prompt
+             session
+             file
+             (car range)
+             (cdr range)
+             instruction)))
+      (with-current-buffer coordinator
+        (vterm-send-string prompt t)
+        (vterm-send-return))
+      (claude-emacs-bridge--log-message
+       session file (car range) (cdr range) instruction)
+      (if (claude-emacs-bridge--await-submit coordinator)
+          (message "Sent to %s: %s lines %d-%d"
+                   (alist-get 'name session)
+                   file
+                   (car range)
+                   (cdr range))
+        (let ((warning
+               (format "Message to %s may not have been submitted; check %s"
+                       (alist-get 'name session)
+                       claude-emacs-bridge-buffer-name)))
+          (claude-emacs-bridge--log-status warning)
+          (message "%s" warning))))))
 
 (provide 'claude-emacs-bridge)
 ;;; claude-emacs-bridge.el ends here

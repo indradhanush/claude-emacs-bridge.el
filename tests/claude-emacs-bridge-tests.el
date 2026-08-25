@@ -241,7 +241,8 @@ An empty picker is a loud failure; offering an unreachable target is a quiet one
 
 (ert-deftest claude-emacs-bridge-select-session-test/replaces-association ()
   "Explicit selection replaces the current context's stored process identity."
-  (let* ((key '(project . "/tmp/project/"))
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (key '(project . "/tmp/project/"))
          (session '((name . "task-2") (pid . 2) (startedAt . 200)))
          (claude-emacs-bridge--targets (make-hash-table :test 'equal)))
     (puthash key '(1 . 100) claude-emacs-bridge--targets)
@@ -258,7 +259,8 @@ An empty picker is a loud failure; offering an unreachable target is a quiet one
 
 (ert-deftest claude-emacs-bridge-list-sessions-test/displays-active-sessions ()
   "The listing command displays the discovered session labels."
-  (let ((session '((name . "task-1")
+  (let ((claude-emacs-bridge--mode 'relay)
+         (session '((name . "task-1")
                    (pid . 1)
                    (status . "idle")
                    (cwd . "/tmp/project"))))
@@ -406,7 +408,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-start-test/starts-owned-vterm ()
   "Starting the coordinator creates its vterm and launches the fixed command."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-start-test*"))
          (created-buffer nil)
          (sent-string nil)
@@ -434,7 +437,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-start-test/reuses-live-owned-vterm ()
   "Starting again reuses the live owned vterm without launching another command."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           "*claude-emacs-bridge-reuse-test*")
          (buffer (generate-new-buffer claude-emacs-bridge-buffer-name))
          (shown-buffer nil))
@@ -459,7 +463,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-start-test/rejects-name-collision ()
   "An unrelated buffer using the coordinator name is preserved and rejected."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           "*claude-emacs-bridge-collision-test*")
          (buffer (generate-new-buffer claude-emacs-bridge-buffer-name)))
     (unwind-protect
@@ -469,7 +474,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-clear-test/sends-clear-to-coordinator ()
   "Clearing sends one /clear command to the coordinator vterm."
-  (let ((coordinator (generate-new-buffer " *claude-emacs-bridge-clear-test*"))
+  (let ((claude-emacs-bridge--mode 'relay)
+         (coordinator (generate-new-buffer " *claude-emacs-bridge-clear-test*"))
         (sent-string nil)
         (sent-paste-p nil)
         (return-count 0))
@@ -490,19 +496,21 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-clear-test/decline-does-not-send ()
   "Clearing stops without terminal input when coordinator startup is declined."
-  (cl-letf (((symbol-function 'claude-emacs-bridge--coordinator-buffer)
+  (let ((claude-emacs-bridge--mode 'relay))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--coordinator-buffer)
              (lambda () nil))
             ((symbol-function 'vterm-send-string)
              (lambda (&rest _) (ert-fail "A declined clear must not send")))
             ((symbol-function 'vterm-send-return)
              (lambda () (ert-fail "A declined clear must not submit")))
             ((symbol-function 'message)
-             (lambda (&rest _) (ert-fail "A declined clear must not report a send"))))
-    (should-not (claude-emacs-bridge-clear))))
+               (lambda (&rest _) (ert-fail "A declined clear must not report a send"))))
+      (should-not (claude-emacs-bridge-clear)))))
 
 (ert-deftest claude-emacs-bridge-send-test/sends-path-lines-and-instruction ()
   "Sending a region pastes only its file location and instruction, then submits."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           "*claude-emacs-bridge-send-test*")
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-send-log-test*"))
@@ -569,7 +577,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-send-test/starts-missing-coordinator-and-sends ()
   "Accepting the prompt starts the coordinator and continues the original send."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-missing-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-missing-log-test*"))
@@ -626,7 +635,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-send-test/declines-missing-coordinator ()
   "Declining the prompt logs the status and stops before target resolution."
-  (let ((claude-emacs-bridge-buffer-name
+  (let ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
          (generate-new-buffer-name "*claude-emacs-bridge-decline-test*"))
         (claude-emacs-bridge-log-buffer-name
          (generate-new-buffer-name "*claude-emacs-bridge-decline-log-test*")))
@@ -685,7 +695,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-send-test/interactive-without-region-sends-current-line ()
   "Interactive sending without a region sends the line containing point."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           "*claude-emacs-bridge-current-line-test*")
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name
@@ -735,6 +746,146 @@ can read is a relay that leaks whatever a path in an instruction points at."
       (should-error
        (call-interactively #'claude-emacs-bridge-send)
        :type 'user-error))))
+
+;;; Delivery mode
+
+(ert-deftest claude-emacs-bridge--ensure-mode-test/prompts-and-saves-first-time ()
+  "With nothing chosen, the first call asks and remembers the answer."
+  (let ((claude-emacs-bridge--mode nil)
+        (claude-emacs-bridge-preferred-transport nil)
+        (saved nil)
+        (prompts 0))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (setq prompts (1+ prompts)) "socket"))
+              ((symbol-function 'customize-save-variable)
+               (lambda (symbol value) (setq saved (cons symbol value)))))
+      (should (eq (claude-emacs-bridge--ensure-mode) 'socket)))
+    (should (= prompts 1))
+    (should (equal saved '(claude-emacs-bridge-preferred-transport . socket)))
+    (should (eq claude-emacs-bridge--mode 'socket))))
+
+(ert-deftest claude-emacs-bridge--ensure-mode-test/saved-preference-does-not-prompt ()
+  "A remembered choice is used without asking again."
+  (let ((claude-emacs-bridge--mode nil)
+        (claude-emacs-bridge-preferred-transport 'relay))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (error "Should not prompt"))))
+      (should (eq (claude-emacs-bridge--ensure-mode) 'relay)))
+    (should (eq claude-emacs-bridge--mode 'relay))))
+
+(ert-deftest claude-emacs-bridge--ensure-mode-test/reuses-the-running-mode ()
+  "An already active mode is returned without consulting the saved option."
+  (let ((claude-emacs-bridge--mode 'socket)
+        (claude-emacs-bridge-preferred-transport 'relay))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (error "Should not prompt"))))
+      (should (eq (claude-emacs-bridge--ensure-mode) 'socket)))))
+
+(ert-deftest claude-emacs-bridge--ensure-mode-test/unrecognized-saved-value-prompts ()
+  "A hand-edited saved value is treated as unset rather than guessed at."
+  (let ((claude-emacs-bridge--mode nil)
+        (claude-emacs-bridge-preferred-transport 'telepathy)
+        (reported nil)
+        (prompts 0))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (setq prompts (1+ prompts)) "relay"))
+              ((symbol-function 'customize-save-variable) (lambda (&rest _) nil))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq reported (apply #'format format-string args)))))
+      (should (eq (claude-emacs-bridge--ensure-mode) 'relay)))
+    (should (= prompts 1))
+    (should (string-match-p "telepathy" reported))))
+
+(ert-deftest claude-emacs-bridge--read-transport-test/names-both-modes-and-the-switch ()
+  "The prompt says what each mode does, that it is remembered, and how to change it."
+  (let ((prompt nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (p &rest _) (setq prompt p) "relay")))
+      (claude-emacs-bridge--read-transport))
+    (should (string-match-p "relay" prompt))
+    (should (string-match-p "socket" prompt))
+    (should (string-match-p "[Rr]emember" prompt))
+    (should (string-match-p "claude-emacs-bridge-switch-transport" prompt))))
+
+(ert-deftest claude-emacs-bridge-send-test/relay-mode-uses-the-relay-path ()
+  "A send in relay mode goes through the relay and not the socket."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (relay-called nil))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--send-via-relay)
+               (lambda (&rest _) (setq relay-called t)))
+              ((symbol-function 'claude-emacs-bridge--send-via-socket)
+               (lambda (&rest _) (error "Wrong path"))))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example.go")
+        (insert "one\ntwo\n")
+        (set-buffer-modified-p nil)
+        (claude-emacs-bridge-send (point-min) (point-min) "Look here.")))
+    (should relay-called)))
+
+(ert-deftest claude-emacs-bridge-send-test/socket-mode-uses-the-socket-path ()
+  "A send in socket mode goes through the socket and not the relay."
+  (let ((claude-emacs-bridge--mode 'socket)
+        (socket-args nil))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--send-via-socket)
+               (lambda (&rest args) (setq socket-args args)))
+              ((symbol-function 'claude-emacs-bridge--send-via-relay)
+               (lambda (&rest _) (error "Wrong path"))))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example.go")
+        (insert "one\ntwo\n")
+        (set-buffer-modified-p nil)
+        (claude-emacs-bridge-send (point-min) (point-min) "Look here.")))
+    (should socket-args)
+    (should (equal (nth 0 socket-args) '(1 . 1)))
+    (should (equal (nth 1 socket-args) "/tmp/example.go"))
+    (should (equal (nth 3 socket-args) "Look here."))))
+
+(ert-deftest claude-emacs-bridge--send-via-socket-test/is-not-implemented-yet ()
+  "The socket path refuses clearly while it is a stub."
+  (should-error (claude-emacs-bridge--send-via-socket '(1 . 1) "/tmp/a.go" nil "x")
+                :type 'user-error))
+
+(ert-deftest claude-emacs-bridge-start-test/refuses-in-socket-mode ()
+  "Starting the coordinator in socket mode names the active mode and the switch."
+  (let ((claude-emacs-bridge--mode 'socket))
+    (condition-case err
+        (progn (claude-emacs-bridge-start) (should nil))
+      (user-error
+       (let ((text (error-message-string err)))
+         (should (string-match-p "socket" text))
+         (should (string-match-p "claude-emacs-bridge-switch-transport" text)))))))
+
+(ert-deftest claude-emacs-bridge-clear-test/refuses-in-socket-mode ()
+  "Clearing the coordinator in socket mode names the active mode and the switch."
+  (let ((claude-emacs-bridge--mode 'socket))
+    (condition-case err
+        (progn (claude-emacs-bridge-clear) (should nil))
+      (user-error
+       (let ((text (error-message-string err)))
+         (should (string-match-p "socket" text))
+         (should (string-match-p "claude-emacs-bridge-switch-transport" text)))))))
+
+(ert-deftest claude-emacs-bridge-start-test/saved-relay-mode-without-vterm-explains ()
+  "A remembered mode whose resources are missing says so instead of failing raw."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (claude-emacs-bridge-buffer-name
+         (generate-new-buffer-name "*claude-emacs-bridge-novterm-test*")))
+    ;; Unbind vterm rather than assume it is absent: it is loaded in a real
+    ;; Emacs and missing in a batch one, and this test must hold in both.
+    (cl-letf (((symbol-function 'vterm) nil)
+              ((symbol-function 'require)
+               (lambda (feature &rest _)
+                 (if (eq feature 'vterm)
+                     (signal 'file-missing (list "No such file" "vterm"))
+                   feature))))
+      (condition-case err
+          (progn (claude-emacs-bridge-start) (should nil))
+        (user-error
+         (let ((text (error-message-string err)))
+           (should (string-match-p "relay" text))
+           (should (string-match-p "vterm" text))
+           (should (string-match-p "claude-emacs-bridge-switch-transport" text))))))))
 
 ;;; Paste submission recovery
 
@@ -825,7 +976,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-send-test/resends-return-when-paste-is-not-submitted ()
   "A send whose carriage return is swallowed resends it and still reports success."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-resend-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-resend-log-test*"))
@@ -878,7 +1030,8 @@ can read is a relay that leaks whatever a path in an instruction points at."
 
 (ert-deftest claude-emacs-bridge-send-test/logs-status-when-submit-never-lands ()
   "A send that never submits logs the failure instead of reporting success."
-  (let* ((claude-emacs-bridge-buffer-name
+  (let* ((claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-stuck-test*"))
          (claude-emacs-bridge-log-buffer-name
           (generate-new-buffer-name "*claude-emacs-bridge-stuck-log-test*"))
