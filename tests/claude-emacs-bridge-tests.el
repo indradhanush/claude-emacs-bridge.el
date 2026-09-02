@@ -1017,6 +1017,87 @@ can read is a relay that leaks whatever a path in an instruction points at."
     (should (string-match-p (format "%d" (emacs-pid))
                             (claude-emacs-bridge--receipt-socket-path)))))
 
+;;; End to end, against a real Claude Code session
+
+;; Everything above fakes its collaborators.  This one does not, because the
+;; claim it checks is that a real session accepts the frame and records having
+;; queued it.  It is gated: the default batch run stays offline and needs no
+;; Claude install.
+;;
+;;   CLAUDE_EMACS_BRIDGE_LIVE_TEST=1 emacs -Q --batch -L . -L tests \
+;;     -l ert -l tests/claude-emacs-bridge-tests.el -f ert-run-tests-batch-and-exit
+
+(defun claude-emacs-bridge-tests--live-p ()
+  "Return non-nil when the live end-to-end test has been asked for."
+  (and (getenv "CLAUDE_EMACS_BRIDGE_LIVE_TEST")
+       (executable-find "claude")))
+
+(defun claude-emacs-bridge-tests--await-registry (name seconds)
+  "Return the registry row named NAME once it has a socket, waiting SECONDS."
+  (let ((deadline (+ (float-time) seconds))
+        (found nil))
+    (while (and (not found) (< (float-time) deadline))
+      (setq found
+            (cl-find-if (lambda (row)
+                          (and (equal (alist-get 'name row) name)
+                               (alist-get 'messagingSocketPath row)))
+                        (claude-emacs-bridge--registry-sessions)))
+      (unless found (sleep-for 0.5)))
+    found))
+
+(ert-deftest claude-emacs-bridge-live-test/reaches-a-real-session ()
+  "A real session accepts the frame and records having queued it.
+
+Isolation matters here, so this is deliberate about it.  The session it talks
+to is one it started itself, named randomly, in a scratch directory of its own.
+It finds that session by matching the exact name it generated, never through
+the picker, so it cannot reach a session someone is using."
+  (skip-unless (claude-emacs-bridge-tests--live-p))
+  (let* ((name (format "emacs-bridge-test-%d-%d" (emacs-pid) (random 100000)))
+         (dir (file-name-as-directory (make-temp-file "bridge-live" t)))
+         (claude-emacs-bridge-log-buffer-name
+          (generate-new-buffer-name "*bridge-live-log-test*"))
+         (claude-emacs-bridge-log-file nil)
+         (claude-emacs-bridge--mode 'socket)
+         (claude-emacs-bridge--sends (make-hash-table :test 'equal))
+         (claude-emacs-bridge--receipts (make-hash-table :test 'equal))
+         (claude-emacs-bridge--receipt-process nil)
+         (claude-emacs-bridge-confirm-timeout 5.0)
+         (default-directory dir)
+         (process nil))
+    (unwind-protect
+        (progn
+          (setq process
+                (start-process
+                 "bridge-live-target" nil
+                 "env" "-u" "DO_NOT_TRACK"
+                 claude-emacs-bridge-program
+                 "--model" "claude-haiku-4-5-20251001"
+                 "--tools" "SendMessage"
+                 "--name" name))
+          (let ((session (claude-emacs-bridge-tests--await-registry name 45)))
+            (should session)
+            (should (equal (alist-get 'name session) name))
+            (let* ((content (claude-emacs-bridge--socket-content
+                             "/tmp/live-check.go" '(1 . 2)
+                             "This is an automated check. Do nothing."))
+                   (id (claude-emacs-bridge--uuid))
+                   (receipt (claude-emacs-bridge--ensure-receipt-socket))
+                   (frame (claude-emacs-bridge--socket-frame
+                           content id
+                           (claude-emacs-bridge--uds-address receipt)))
+                   (transcript (claude-emacs-bridge--transcript-path session))
+                   (offset (claude-emacs-bridge--transcript-offset transcript)))
+              (claude-emacs-bridge--write-frame
+               (alist-get 'messagingSocketPath session) frame)
+              (should (claude-emacs-bridge--await-enqueue
+                       session transcript offset content)))))
+      (claude-emacs-bridge--release-receipt-socket)
+      (when (process-live-p process) (kill-process process))
+      (when (get-buffer claude-emacs-bridge-log-buffer-name)
+        (kill-buffer claude-emacs-bridge-log-buffer-name))
+      (ignore-errors (delete-directory dir t)))))
+
 ;;; Switching modes
 
 (ert-deftest claude-emacs-bridge-switch-transport-test/same-mode-does-nothing ()
