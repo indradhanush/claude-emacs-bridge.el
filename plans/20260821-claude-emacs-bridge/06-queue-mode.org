@@ -1,5 +1,5 @@
 :PROPERTIES:
-:STATUS: DRAFT
+:STATUS: DONE
 :STATUS_UPDATED_ON: 2026-09-15
 :END:
 #+title: Queue Mode
@@ -142,7 +142,7 @@ Instruction: this needs a docstring
 
 * Tasks
 
-** TODO Add state and the toggle command
+** DONE Add state and the toggle command
 Add =claude-emacs-bridge-queue-mode= and =claude-emacs-bridge--queue=. Add
 =claude-emacs-bridge-toggle-queue-mode=.
 
@@ -152,7 +152,7 @@ prompts, and the toggle completes either way — a "no" answer leaves
 =--queue= intact and mode on, a "yes" answer empties =--queue= and leaves
 mode on. The report names the current queue length.
 
-** TODO Route =claude-emacs-bridge-send= into the queue
+** DONE Route =claude-emacs-bridge-send= into the queue
 When queue mode is on, capture an entry (including the snippet text) and
 push it instead of calling either transport. Off keeps today's behavior
 unchanged.
@@ -161,7 +161,7 @@ Test: queue mode on appends an entry with the right fields and does not
 call either transport function; queue mode off is untouched (existing
 tests keep passing).
 
-** TODO Truncation and language mapping
+** DONE Truncation and language mapping
 Add =claude-emacs-bridge--truncate-lines= and the extension-to-language
 helper. Both pure.
 
@@ -169,7 +169,7 @@ Test: 7 lines shows all 7; exactly 10 shows all 10; 11 and 15 lines each
 truncate to first 5 + marker + last 5 with correct line numbers; unknown
 extension falls back to =text=; each mapped extension resolves correctly.
 
-** TODO =claude-emacs-bridge-show-queue=
+** DONE =claude-emacs-bridge-show-queue=
 Build the org buffer from =--queue= using the truncation and language
 helpers. Empty queue shows a buffer saying so rather than erroring.
 
@@ -177,7 +177,7 @@ Test: buffer major mode is =org-mode=; content matches the shape in
 [[*Example Output]] for a fixture queue of one truncated and one
 full-length entry; empty queue renders without error.
 
-** TODO Combined message builders
+** DONE Combined message builders
 Add the socket and relay combined-content builders, reusing the existing
 per-entry field formatting. Pure functions, no I/O.
 
@@ -186,7 +186,7 @@ content wraps the same body in the existing markers and instruction; an
 =@path= inside one entry's instruction is escaped on the relay builder and
 not on the socket builder, matching today's single-entry rule.
 
-** TODO =claude-emacs-bridge-send-queue=
+** DONE =claude-emacs-bridge-send-queue=
 Resolve target, dispatch through the active transport with the combined
 builder. Each combined-send function (=--send-combined-via-socket=,
 =--send-combined-via-relay=) reports back, by its return value, whether the
@@ -239,5 +239,13 @@ process or vterm.
 
 * Next Steps
 
-- [ ] Start on the state and toggle command, TDD per task above, in task
-  order.
+All six tasks are implemented and tested. Full suite: 169 tests, 168 as
+expected, 1 pre-existing skip (=claude-emacs-bridge-live-test/reaches-a-real-session=,
+gated on a real =claude= process), 0 unexpected.
+
+- [X] State, toggle command, routing, truncation, language mapping,
+  =show-queue=, combined builders, =send-queue=.
+
+Making the queue buffer itself editable (instructions only, not the
+captured region) is a separate follow-on:
+[[file:./07-editable-queue-buffer.org][Editable Queue Buffer]].
