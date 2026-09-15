@@ -2425,6 +2425,37 @@ Same reason the relay path drops background agents."
       (should (equal (plist-get entry :lines) '("first" "second"))))
     (should (equal reported "Queued (1): /tmp/example.go lines 1-2"))))
 
+;; claude-emacs-bridge--send-prompt
+
+(ert-deftest claude-emacs-bridge--send-prompt-test/queue-mode-off-is-unprefixed ()
+  "The prompt carries no queue-mode marker when queue mode is off."
+  (let ((claude-emacs-bridge-queue-mode nil))
+    (should (equal (claude-emacs-bridge--send-prompt)
+                    "Instruction for Claude target: "))))
+
+(ert-deftest claude-emacs-bridge--send-prompt-test/queue-mode-on-is-prefixed ()
+  "The prompt is prefixed with (QueueMode) when queue mode is on."
+  (let ((claude-emacs-bridge-queue-mode t))
+    (should (equal (claude-emacs-bridge--send-prompt)
+                    "(QueueMode) Instruction for Claude target: "))))
+
+(ert-deftest claude-emacs-bridge-send-test/interactive-prompt-reflects-queue-mode ()
+  "Interactively invoking send passes the queue-mode-prefixed prompt to
+`read-string' when queue mode is on."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (claude-emacs-bridge-queue-mode t)
+        (claude-emacs-bridge--queue nil)
+        (seen-prompt nil))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &rest _) (setq seen-prompt prompt) "do it"))
+              ((symbol-function 'message) (lambda (&rest _) nil)))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example.go")
+        (insert "line\n")
+        (set-buffer-modified-p nil)
+        (call-interactively #'claude-emacs-bridge-send)))
+    (should (equal seen-prompt "(QueueMode) Instruction for Claude target: "))))
+
 ;; Truncation and language mapping
 
 (ert-deftest claude-emacs-bridge--truncate-lines-test/seven-lines-shows-all ()
@@ -2527,17 +2558,17 @@ Same reason the relay path drops background agents."
               (should (string-match-p "43: \n" text)))))
       (when buffer (kill-buffer buffer)))))
 
-(ert-deftest claude-emacs-bridge-show-queue-test/empty-queue-renders-without-error ()
-  "An empty queue renders a buffer saying so, rather than erroring."
+(ert-deftest claude-emacs-bridge-show-queue-test/empty-queue-messages-instead-of-showing ()
+  "An empty queue reports so in the echo area and does not show a buffer."
   (let ((claude-emacs-bridge--queue nil)
-        (buffer nil))
-    (unwind-protect
-        (progn
-          (setq buffer (claude-emacs-bridge-show-queue))
-          (with-current-buffer buffer
-            (should (derived-mode-p 'org-mode))
-            (should (string-match-p "empty" (buffer-string)))))
-      (when buffer (kill-buffer buffer)))))
+        (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages)))
+              ((symbol-function 'pop-to-buffer)
+               (lambda (&rest _) (ert-fail "An empty queue must not show a buffer"))))
+      (should-not (claude-emacs-bridge-show-queue)))
+    (should (member "Queue is empty" messages))))
 
 ;; claude-emacs-bridge--format-queue-entry: properties drawer and protection
 

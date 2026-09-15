@@ -1280,22 +1280,30 @@ time shown in a source block, truncated by `claude-emacs-bridge--truncate-lines'
 Everything but each entry's instruction text is read-only; edit the
 instruction and commit with `claude-emacs-bridge-queue-buffer-commit' (bound
 to \\`C-c C-c') to write the changes back to `claude-emacs-bridge--queue'.
-An empty queue shows a buffer saying so, rather than erroring."
+An empty queue reports so in the echo area instead of showing a buffer."
   (interactive)
-  (let ((buffer (get-buffer-create "*Claude Bridge Queue*")))
-    (with-current-buffer buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (if claude-emacs-bridge--queue
-            (insert (mapconcat #'claude-emacs-bridge--format-queue-entry
-                                claude-emacs-bridge--queue "\n"))
-          (insert "Queue is empty.\n")))
-      (org-mode)
-      (use-local-map
-       (make-composed-keymap claude-emacs-bridge-queue-buffer-map
-                              (current-local-map))))
-    (pop-to-buffer buffer)
-    buffer))
+  (if (null claude-emacs-bridge--queue)
+      (progn (message "Queue is empty") nil)
+    (let ((buffer (get-buffer-create "*Claude Bridge Queue*")))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (mapconcat #'claude-emacs-bridge--format-queue-entry
+                              claude-emacs-bridge--queue "\n")))
+        (org-mode)
+        (use-local-map
+         (make-composed-keymap claude-emacs-bridge-queue-buffer-map
+                                (current-local-map))))
+      (pop-to-buffer buffer)
+      buffer)))
+
+(defun claude-emacs-bridge--send-prompt ()
+  "Return the minibuffer prompt for `claude-emacs-bridge-send'.
+Prefixed with \"(QueueMode) \" when `claude-emacs-bridge-queue-mode' is on, so
+the prompt itself shows whether this instruction will queue or send
+immediately."
+  (concat (if claude-emacs-bridge-queue-mode "(QueueMode) " "")
+          "Instruction for Claude target: "))
 
 (defun claude-emacs-bridge-send (beg end instruction)
   "Send the file location from BEG to END to the coordinator.
@@ -1311,7 +1319,7 @@ queued instead of being sent; flush the queue with
        (user-error "The current buffer is not visiting a file"))
      (list (if (use-region-p) (region-beginning) (point))
            (if (use-region-p) (region-end) (point))
-           (read-string "Instruction for Claude target: "))))
+           (read-string (claude-emacs-bridge--send-prompt)))))
   (unless buffer-file-name
     (user-error "The current buffer is not visiting a file"))
   (when (or (not (stringp instruction))
