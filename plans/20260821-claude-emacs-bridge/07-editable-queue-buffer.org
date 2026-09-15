@@ -1,0 +1,210 @@
+:PROPERTIES:
+:STATUS: DONE
+:STATUS_UPDATED_ON: 2026-09-15
+:END:
+#+title: Editable Queue Buffer
+#+date: 2026-09-15
+
+* Objective
+
+[[file:./06-queue-mode.org][Queue Mode]] built =claude-emacs-bridge-show-queue= as a read-only-in-spirit
+display. This makes it actually editable: the instruction on each queued
+entry can be changed in the buffer and committed back, while the
+location metadata and the captured snippet cannot be touched at all.
+
+Two constraints, stated by Dhanush:
+
+1. Editing the instruction must be doable.
+2. Editing the selected region's captured content must not be doable —
+   an edit attempt there is ignored (Emacs refuses it and dings, via a
+   =read-only= text property, not a discard-on-commit convention).
+
+Extended in review: only the instruction is editable. The heading, the
+properties drawer, and the src block are all protected the same way.
+Deleting an entire entry's block (heading through the end of its src
+block) and committing removes that entry from the queue — commit fully
+recreates =claude-emacs-bridge--queue= from what the buffer holds, it does
+not patch the existing list.
+
+* The Round-Trip Problem
+
+=--format-queue-entry= today shows =(file-name-nondirectory file)=, never
+the absolute path, and the src block shows a truncated, line-numbered,
+marker-bearing rendering of =:lines=, never the raw captured strings. If
+commit re-parses the buffer to rebuild each plist from scratch, both
+=:file= and =:lines= must round-trip exactly, or every commit permanently
+degrades them — a truncated view committed once could not be
+un-truncated by a later =show-queue=.
+
+* Buffer Format
+
+A =:PROPERTIES:= drawer, one per heading, carries every field that must
+round-trip losslessly. The heading text stays as it is today, for
+reading; nothing parses it.
+
+#+begin_example
+* claude-emacs-bridge.el (lines 100-114, cols 0-40)
+:PROPERTIES:
+:SOURCE-FILE: /abs/path/to/claude-emacs-bridge.el
+:START-LINE: 100
+:END-LINE: 114
+:START-COL: 0
+:END-COL: 40
+:LINES: ("(defun claude-emacs-bridge--example (x)" "  \"Docstring line one.\"" ...)
+:END:
+Instruction: fix the off-by-one here
+
+#+begin_src emacs-lisp
+100: (defun claude-emacs-bridge--example (x)
+...
+#+end_src
+#+end_example
+
+The property is =SOURCE-FILE=, not =FILE= as first drafted: org reserves
+=FILE= as a special property (see =org-special-properties=) that always
+reads back as =buffer-file-name=, silently ignoring any drawer value —
+=org-entry-get= returned nil for it in testing. Caught during
+implementation, not a design change.
+
+=:LINES:= holds =(prin1-to-string (plist-get entry :lines))= — a single-line
+Lisp literal, read back with =(read (org-entry-get pos "LINES"))=. This is
+what keeps the src block's truncation from ever being fed back in as if
+it were source text: commit never derives =:lines= from the visible src
+block, only from this property.
+
+=:START-LINE:=, =:END-LINE:=, =:START-COL:=, =:END-COL:= are read with
+=org-entry-get= and =string-to-number=, not regexed out of the heading.
+The heading is display only.
+
+* What Is Protected
+
+Everything except the instruction's typed text: the heading line, the
+whole properties drawer, the blank line after it, the =Instruction: =
+label itself, the blank line before the src block, and the entire src
+block including its =#+begin_src=/=#+end_src= fences.
+
+Mechanism: the =read-only= text property, applied by =show-queue= after
+inserting each entry. Not =buffer-read-only= for the whole buffer —
+that would block the instruction too.
+
+- The protected spans get =read-only t=.
+- The span ending the =Instruction: = label gets =rear-nonsticky t= so
+  typing immediately after the label is not born read-only.
+- The newline that starts the blank line after the instruction is plain
+  =read-only t=, with no =front-sticky=. =read-only= alone already blocks
+  =backward-delete-char= from removing that newline (deleting a read-only
+  character is refused regardless of stickiness); =front-sticky= is not
+  needed for that and was verified, in an isolated batch Emacs, to have
+  a worse effect: it also blocks inserting new text at the end of the
+  instruction — exactly where a user naturally types to extend it (e.g.
+  after =C-e=). Confirmed both ways by direct test, not by the manual
+  alone: with =front-sticky=, appending at end-of-instruction signals
+  =text-read-only=; without it, appending works and the newline is still
+  undeletable.
+
+Result: point can move freely everywhere for reading. Insertion and
+deletion only take effect inside the unprotected span holding the
+instruction's text. An edit attempted anywhere else signals
+=text-read-only= (Emacs's own default handling — no custom error message
+needed) and changes nothing, which is what "ignored" means here.
+
+* Committing
+
+=claude-emacs-bridge-queue-buffer-commit=, bound to =C-c C-c= in the queue
+buffer (a small local keymap set when the buffer is built, not a new
+global minor mode).
+
+Algorithm:
+
+1. Walk every level-1 heading in the buffer, in order (=org-map-entries=
+   or an equivalent manual loop — whichever reads more clearly next to
+   the rest of the file's style).
+2. For each: read =FILE=, =START-LINE=, =END-LINE=, =START-COL=, =END-COL=,
+   =LINES= from its properties drawer via =org-entry-get=; read the
+   instruction by finding the =Instruction: = line in the entry's body and
+   taking the rest of that line as-is.
+3. Build a fresh plist per heading, in the same shape
+   =--enqueue-send= already produces.
+4. Replace =claude-emacs-bridge--queue= with the full list built this way.
+   Nothing from the old list is reused or patched in; a heading absent
+   from the buffer (because its block was deleted) simply does not
+   appear in the rebuilt list.
+5. Report how many entries were committed.
+
+A malformed or missing property (someone hand-edited the drawer despite
+it being read-only, or deleted only part of a block) is a real failure
+mode worth a clear error rather than a silent bad entry — signal a
+=user-error= naming which heading and which property, and commit nothing
+for any heading in that call rather than partially updating the queue.
+
+* Tasks
+
+** DONE Extend entry rendering with the properties drawer and protection
+Rewrite =--format-queue-entry= to emit the drawer shown above. Add the
+text-property pass (either inline while inserting, or as a second pass
+over the buffer after everything is inserted — whichever keeps the
+function readable) that marks every span but the instruction's text
+read-only, with the sticky properties described above.
+
+Test: rendering one entry produces the drawer with all five properties
+and the correct =:LINES:= literal; a round-trip through
+=(read (org-entry-get pos "LINES"))= reproduces the original list exactly,
+including a >10-line entry whose visible src block is truncated (the
+property must hold the *untruncated* list); attempting
+=(let ((inhibit-read-only nil)) ...)=-wrapped modification of the heading,
+the drawer, or the src block signals =text-read-only=; typing immediately
+after the =Instruction: = label succeeds and does not inherit
+=read-only=; typing at the end of the instruction line does not bleed
+into the following blank line's read-only newline.
+
+** DONE Add the commit command
+Add =claude-emacs-bridge-queue-buffer-commit=, its local keymap binding to
+=C-c C-c= set up by =claude-emacs-bridge-show-queue=, and the parser that
+walks headings and rebuilds the list.
+
+Test: editing an instruction's text and committing updates that entry's
+=:instruction= in =claude-emacs-bridge--queue= and leaves every other field
+unchanged, including =:lines= for a truncated entry (must still be the
+full untruncated list, read from the property, not the visible rows);
+deleting one entry's whole block and committing removes exactly that
+entry, in one call, without touching the others; an empty buffer (every
+block deleted) commits to an empty queue; a drawer missing a required
+property signals =user-error= naming the heading and the property, and
+=claude-emacs-bridge--queue= is left unchanged by that call.
+
+* Testing
+
+Per =CLAUDE.md=, every new helper gets a direct ERT test, faking buffer
+state by building it with =with-temp-buffer= and =org-mode=, not by
+driving real keyboard input.
+
+* Decisions
+
+- 2026-09-15 :: Only the instruction's typed text is editable. Heading,
+  properties drawer, and src block are all protected the same way, not
+  just the src block.
+- 2026-09-15 :: Protection is a =read-only= text property, refused and
+  dinged by Emacs directly — not an allow-then-discard-on-commit
+  convention.
+- 2026-09-15 :: Commit fully recreates =claude-emacs-bridge--queue= from
+  the buffer's current headings. It does not patch the existing list by
+  position or by id. Deleting a block and committing removes that entry.
+- 2026-09-15 :: The captured snippet round-trips through a =:LINES:=
+  property holding =prin1-to-string= of the original list, never
+  re-derived from the (possibly truncated) visible src block.
+- 2026-09-15 :: Commit is explicit, bound to =C-c C-c=, not a live
+  sync-on-every-keystroke hook.
+
+* Next Steps
+
+Both tasks are implemented and tested. Full suite: 184 tests, 183 as
+expected, 1 pre-existing skip, 0 unexpected.
+
+- [X] Properties drawer, protection pass, commit command.
+
+One design correction made during review, verified directly in an
+isolated batch Emacs rather than assumed from the manual: dropped
+=front-sticky= from the blank-line boundary (see
+[[*What Is Protected][What Is Protected]]). As first specified it also
+blocked ordinary typing at the end of the instruction, which would have
+undermined the whole point of making the instruction editable.
