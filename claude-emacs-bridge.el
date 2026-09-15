@@ -12,6 +12,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'org)
 (require 'project)
 (require 'subr-x)
 (require 'url-util)
@@ -1098,30 +1099,145 @@ deferred to `claude-emacs-bridge-send-queue'."
     entry))
 
 (defun claude-emacs-bridge--format-queue-entry (entry)
-  "Return the org text rendering one queue ENTRY."
+  "Return the org text rendering one queue ENTRY.
+Emits a :PROPERTIES: drawer carrying SOURCE-FILE, START-LINE, END-LINE,
+START-COL, END-COL, and LINES, so `claude-emacs-bridge-queue-buffer-commit'
+can rebuild ENTRY losslessly later.  The property is named SOURCE-FILE, not
+FILE, because \"FILE\" is one of org's special properties (it always reads
+back as `buffer-file-name', never a drawer value); see `org-special-properties'.
+LINES holds `prin1-to-string' of the entry's full,
+untruncated captured lines, read back with `(read (org-entry-get pos
+\"LINES\"))'; it is never derived from the visible (possibly truncated) src
+block.  The heading text and the src block's line numbers are for reading
+only, and are never parsed back.
+
+Everything in the result except the instruction's typed text carries the
+`read-only' text property (with the sticky properties needed at its edges),
+so a caller that inserts this string verbatim gets an editable instruction
+and a protected heading, drawer, and src block for free."
   (let* ((file (plist-get entry :file))
          (start-line (plist-get entry :start-line))
          (end-line (plist-get entry :end-line))
          (start-col (plist-get entry :start-col))
          (end-col (plist-get entry :end-col))
          (instruction (plist-get entry :instruction))
-         (rows (claude-emacs-bridge--truncate-lines
-                (plist-get entry :lines) start-line)))
-    (concat
-     (format "* %s (lines %d-%d, cols %d-%d)\n"
-             (file-name-nondirectory file) start-line end-line start-col end-col)
-     (format "Instruction: %s\n\n" instruction)
-     (format "#+begin_src %s\n" (claude-emacs-bridge--babel-language file))
-     (mapconcat
-      (lambda (row)
-        (if (car row) (format "%d: %s" (car row) (cdr row)) (cdr row)))
-      rows "\n")
-     "\n#+end_src\n")))
+         (lines (plist-get entry :lines))
+         (rows (claude-emacs-bridge--truncate-lines lines start-line))
+         (heading (format "* %s (lines %d-%d, cols %d-%d)\n"
+                           (file-name-nondirectory file)
+                           start-line end-line start-col end-col))
+         (drawer (concat
+                  ":PROPERTIES:\n"
+                  (format ":SOURCE-FILE: %s\n" file)
+                  (format ":START-LINE: %d\n" start-line)
+                  (format ":END-LINE: %d\n" end-line)
+                  (format ":START-COL: %d\n" start-col)
+                  (format ":END-COL: %d\n" end-col)
+                  (format ":LINES: %s\n"
+                          (let ((print-escape-newlines t))
+                            (prin1-to-string lines)))
+                  ":END:\n"))
+         ;; `copy-sequence' so `put-text-property' below never mutates a
+         ;; shared byte-compiled string constant.
+         (label (copy-sequence "Instruction: "))
+         ;; Two newlines: the first ends the instruction line, the second is
+         ;; the blank line's own terminator.  Both are read-only, which is
+         ;; enough on its own to block `backward-delete-char' from merging
+         ;; the blank line into the instruction.  No `front-sticky': that
+         ;; would also block inserting new text at the end of the
+         ;; instruction, which is exactly where a user normally types to
+         ;; extend it.
+         (blank (copy-sequence "\n\n"))
+         (src (concat
+               (format "#+begin_src %s\n" (claude-emacs-bridge--babel-language file))
+               (mapconcat
+                (lambda (row)
+                  (if (car row) (format "%d: %s" (car row) (cdr row)) (cdr row)))
+                rows "\n")
+               "\n#+end_src\n")))
+    (put-text-property 0 (length heading) 'read-only t heading)
+    (put-text-property 0 (length drawer) 'read-only t drawer)
+    (put-text-property 0 (length label) 'read-only t label)
+    (put-text-property (1- (length label)) (length label) 'rear-nonsticky t label)
+    (put-text-property 0 (length blank) 'read-only t blank)
+    (put-text-property 0 (length src) 'read-only t src)
+    (concat heading drawer label instruction blank src)))
+
+(defvar claude-emacs-bridge-queue-buffer-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'claude-emacs-bridge-queue-buffer-commit)
+    map)
+  "Keymap layered over the queue buffer's `org-mode-map'.
+Only adds `claude-emacs-bridge-queue-buffer-commit' on \\`C-c C-c'; every
+other binding still comes from `org-mode-map' via its parent keymap.")
+
+(defun claude-emacs-bridge--required-property (heading prop)
+  "Return PROP for the entry at point, or signal `user-error' naming HEADING.
+PROP is read with `org-entry-get'; a missing or empty value is treated as
+absent."
+  (let ((value (org-entry-get (point) prop)))
+    (if (and value (not (string-empty-p value)))
+        value
+      (user-error "Queued entry %S is missing the %s property" heading prop))))
+
+(defun claude-emacs-bridge--queue-entry-at-point ()
+  "Parse the queue entry plist for the heading at point.
+Reads SOURCE-FILE, START-LINE, END-LINE, START-COL, END-COL, and LINES from
+the entry's properties drawer via `org-entry-get', never from the heading
+text or the (possibly truncated) src block.  The instruction is the rest of
+the `Instruction: ' line found in the entry's body.  Signals `user-error'
+naming the heading and the missing property or line when the entry is
+incomplete."
+  (let* ((heading (org-get-heading t t t t))
+         (file (claude-emacs-bridge--required-property heading "SOURCE-FILE"))
+         (start-line (string-to-number
+                      (claude-emacs-bridge--required-property heading "START-LINE")))
+         (end-line (string-to-number
+                    (claude-emacs-bridge--required-property heading "END-LINE")))
+         (start-col (string-to-number
+                     (claude-emacs-bridge--required-property heading "START-COL")))
+         (end-col (string-to-number
+                   (claude-emacs-bridge--required-property heading "END-COL")))
+         (lines (read (claude-emacs-bridge--required-property heading "LINES")))
+         (subtree-end (save-excursion (org-end-of-subtree t t) (point)))
+         (instruction
+          (save-excursion
+            (if (re-search-forward "^Instruction: \\(.*\\)$" subtree-end t)
+                (match-string-no-properties 1)
+              (user-error "Queued entry %S is missing its Instruction line"
+                          heading)))))
+    (list :file file
+          :start-line start-line
+          :end-line end-line
+          :start-col start-col
+          :end-col end-col
+          :instruction instruction
+          :lines lines)))
+
+(defun claude-emacs-bridge-queue-buffer-commit ()
+  "Rebuild `claude-emacs-bridge--queue' from the current queue buffer.
+Walks every heading in order and replaces the queue outright with what it
+finds; nothing from the previous list is reused or patched in by position or
+id.  A heading whose block was deleted from the buffer is simply absent from
+the rebuilt queue, and deleting every block commits an empty queue.
+
+A drawer missing a required property, or an entry missing its `Instruction: '
+line, signals `user-error' naming the heading and what is missing, and
+commits nothing for this call; `claude-emacs-bridge--queue' is left
+unchanged."
+  (interactive)
+  (let ((entries (org-map-entries #'claude-emacs-bridge--queue-entry-at-point)))
+    (setq claude-emacs-bridge--queue entries)
+    (message "Committed %d queued entr%s"
+             (length entries) (if (= (length entries) 1) "y" "ies"))))
 
 (defun claude-emacs-bridge-show-queue ()
   "Display the queued entries in an org-mode buffer.
 Each entry is rendered as its own heading, with the snippet captured at queue
 time shown in a source block, truncated by `claude-emacs-bridge--truncate-lines'.
+Everything but each entry's instruction text is read-only; edit the
+instruction and commit with `claude-emacs-bridge-queue-buffer-commit' (bound
+to \\`C-c C-c') to write the changes back to `claude-emacs-bridge--queue'.
 An empty queue shows a buffer saying so, rather than erroring."
   (interactive)
   (let ((buffer (get-buffer-create "*Claude Bridge Queue*")))
@@ -1132,7 +1248,10 @@ An empty queue shows a buffer saying so, rather than erroring."
             (insert (mapconcat #'claude-emacs-bridge--format-queue-entry
                                 claude-emacs-bridge--queue "\n"))
           (insert "Queue is empty.\n")))
-      (org-mode))
+      (org-mode)
+      (use-local-map
+       (make-composed-keymap claude-emacs-bridge-queue-buffer-map
+                              (current-local-map))))
     (pop-to-buffer buffer)
     buffer))
 

@@ -2445,6 +2445,260 @@ Same reason the relay path drops background agents."
             (should (string-match-p "empty" (buffer-string)))))
       (when buffer (kill-buffer buffer)))))
 
+;; claude-emacs-bridge--format-queue-entry: properties drawer and protection
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/emits-properties-drawer ()
+  "The drawer carries FILE, START-LINE, END-LINE, START-COL, END-COL, LINES."
+  (let* ((entry (list :file "/tmp/a.el" :start-line 10 :end-line 12
+                       :start-col 2 :end-col 5
+                       :instruction "do the thing"
+                       :lines (list "one" "two" "three")))
+         (text (claude-emacs-bridge--format-queue-entry entry)))
+    (should (string-match-p ":PROPERTIES:" text))
+    (should (string-match-p ":SOURCE-FILE: /tmp/a\\.el" text))
+    (should (string-match-p ":START-LINE: 10" text))
+    (should (string-match-p ":END-LINE: 12" text))
+    (should (string-match-p ":START-COL: 2" text))
+    (should (string-match-p ":END-COL: 5" text))
+    (should (string-match-p
+             (regexp-quote
+              (format ":LINES: %s" (prin1-to-string (list "one" "two" "three"))))
+             text))
+    (should (string-match-p ":END:" text))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/lines-property-round-trips-untruncated ()
+  "LINES holds the full list even when the visible src block is truncated."
+  (let* ((lines (append (list "l1" "l2" "l3" "l4" "l5")
+                         (list "l6" "l7" "l8" "l9" "l10")
+                         (list "l11" "l12" "l13")))
+         (entry (list :file "/tmp/a.el" :start-line 1 :end-line 13
+                       :start-col 0 :end-col 0
+                       :instruction "x" :lines lines)))
+    (with-temp-buffer
+      (org-mode)
+      (let ((inhibit-read-only t))
+        (insert (claude-emacs-bridge--format-queue-entry entry)))
+      (goto-char (point-min))
+      (should (equal (read (org-entry-get (point) "LINES")) lines)))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/heading-drawer-and-src-are-protected ()
+  "Editing the heading, drawer, or src block is refused via `text-read-only'."
+  (let ((entry (list :file "/tmp/a.el" :start-line 1 :end-line 2
+                      :start-col 0 :end-col 0
+                      :instruction "do it" :lines (list "a" "b"))))
+    (with-temp-buffer
+      (org-mode)
+      (let ((inhibit-read-only t))
+        (insert (claude-emacs-bridge--format-queue-entry entry)))
+      ;; Each position is inside the protected text, not at its leading
+      ;; edge: insertion right before a `read-only' span is allowed by
+      ;; default unless that span is `front-sticky', which nothing here is,
+      ;; so probing the boundary itself would not exercise the protection
+      ;; this test is for.
+      (dolist (pos (list (progn (goto-char (point-min))
+                                 (search-forward "a.el")
+                                 (match-beginning 0))
+                          (progn (goto-char (point-min))
+                                 (search-forward ":PROPERTIES:")
+                                 (1+ (match-beginning 0)))
+                          (progn (goto-char (point-min))
+                                 (search-forward "#+begin_src")
+                                 (1+ (match-beginning 0)))))
+        (goto-char pos)
+        (let ((inhibit-read-only nil))
+          (should-error (insert "X") :type 'text-read-only))))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/instruction-editable-right-after-label ()
+  "Point right after `Instruction: ' accepts typed text, not born read-only."
+  (let ((entry (list :file "/tmp/a.el" :start-line 1 :end-line 2
+                      :start-col 0 :end-col 0
+                      :instruction "keep this" :lines (list "a" "b"))))
+    (with-temp-buffer
+      (org-mode)
+      (let ((inhibit-read-only t))
+        (insert (claude-emacs-bridge--format-queue-entry entry)))
+      (goto-char (point-min))
+      (search-forward "Instruction: ")
+      (let ((inhibit-read-only nil))
+        (insert "X"))
+      (should (looking-at-p "keep this")))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/instruction-end-extends-but-blank-line-is-protected ()
+  "Typing at the end of the instruction works; deleting the blank line does not.
+`read-only' alone blocks `backward-delete-char' from merging the blank line
+into the instruction, with no need for `front-sticky' on that boundary -
+`front-sticky' there would also block ordinary typing at the end of the
+instruction, which is exactly where a user naturally extends it (e.g. after
+`end-of-line')."
+  (let ((entry (list :file "/tmp/a.el" :start-line 1 :end-line 2
+                      :start-col 0 :end-col 0
+                      :instruction "the end" :lines (list "a" "b"))))
+    (with-temp-buffer
+      (org-mode)
+      (let ((inhibit-read-only t))
+        (insert (claude-emacs-bridge--format-queue-entry entry)))
+      (goto-char (point-min))
+      (search-forward "the end")
+      (let ((inhibit-read-only nil))
+        (insert "!"))
+      (should (looking-back "the end!" (line-beginning-position)))
+      (forward-line 1)
+      (let ((inhibit-read-only nil))
+        (should-error (backward-delete-char 1) :type 'text-read-only)))))
+
+;; claude-emacs-bridge-queue-buffer-commit
+
+(ert-deftest claude-emacs-bridge--required-property-test/missing-property-signals-user-error ()
+  "A missing property signals `user-error' naming the heading and the property."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* some heading\n:PROPERTIES:\n:END:\n")
+    (goto-char (point-min))
+    (should-error (claude-emacs-bridge--required-property "some heading" "SOURCE-FILE")
+                  :type 'user-error)))
+
+(ert-deftest claude-emacs-bridge--required-property-test/empty-property-signals-user-error ()
+  "An empty property value is treated as absent, per the docstring's contract."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* some heading\n:PROPERTIES:\n:SOURCE-FILE: \n:END:\n")
+    (goto-char (point-min))
+    (should-error (claude-emacs-bridge--required-property "some heading" "SOURCE-FILE")
+                  :type 'user-error)))
+
+(ert-deftest claude-emacs-bridge--required-property-test/present-property-returns-value ()
+  "A present property is returned as-is."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* some heading\n:PROPERTIES:\n:SOURCE-FILE: /tmp/a.el\n:END:\n")
+    (goto-char (point-min))
+    (should (equal (claude-emacs-bridge--required-property "some heading" "SOURCE-FILE")
+                    "/tmp/a.el"))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/edited-instruction-updates-queue ()
+  "Editing an instruction and committing updates only that entry's field."
+  (let ((claude-emacs-bridge--queue
+         (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                      :start-col 0 :end-col 0
+                      :instruction "old instruction" :lines (list "a"))
+               (list :file "/tmp/b.el" :start-line 5 :end-line 5
+                      :start-col 2 :end-col 9
+                      :instruction "leave me alone" :lines (list "b"))))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (goto-char (point-min))
+            (search-forward "Instruction: ")
+            (delete-region (point) (line-end-position))
+            (insert "new instruction")
+            (claude-emacs-bridge-queue-buffer-commit))
+          (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :instruction)
+                          "new instruction"))
+          (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :file) "/tmp/a.el"))
+          (should (equal (plist-get (nth 1 claude-emacs-bridge--queue) :instruction)
+                          "leave me alone")))
+      (when buffer (kill-buffer buffer)))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/lines-stay-untruncated-after-commit ()
+  "Committing without editing keeps LINES as the full, untruncated list."
+  (let* ((lines (append (list "l1" "l2" "l3" "l4" "l5")
+                         (list "l6" "l7" "l8" "l9" "l10")
+                         (list "l11" "l12" "l13")))
+         (claude-emacs-bridge--queue
+          (list (list :file "/tmp/a.el" :start-line 1 :end-line 13
+                       :start-col 0 :end-col 0
+                       :instruction "x" :lines lines)))
+         (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (claude-emacs-bridge-queue-buffer-commit))
+          (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :lines) lines)))
+      (when buffer (kill-buffer buffer)))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/deleted-block-removes-only-that-entry ()
+  "Deleting one entry's block and committing removes exactly that entry."
+  (let ((claude-emacs-bridge--queue
+         (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                      :start-col 0 :end-col 0
+                      :instruction "delete me" :lines (list "a"))
+               (list :file "/tmp/b.el" :start-line 5 :end-line 5
+                      :start-col 2 :end-col 9
+                      :instruction "keep me" :lines (list "b"))))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (let ((inhibit-read-only t))
+              (goto-char (point-min))
+              (org-back-to-heading t)
+              (let ((beg (point))
+                    (end (save-excursion (org-end-of-subtree t t) (point))))
+                (delete-region beg end)))
+            (claude-emacs-bridge-queue-buffer-commit))
+          (should (= (length claude-emacs-bridge--queue) 1))
+          (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :file)
+                          "/tmp/b.el")))
+      (when buffer (kill-buffer buffer)))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/empty-buffer-commits-empty-queue ()
+  "An empty buffer (every block deleted) commits to an empty queue."
+  (let ((claude-emacs-bridge--queue
+         (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                      :start-col 0 :end-col 0
+                      :instruction "x" :lines (list "a")))))
+    (with-temp-buffer
+      (org-mode)
+      (claude-emacs-bridge-queue-buffer-commit)
+      (should-not claude-emacs-bridge--queue))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/missing-property-signals-user-error-and-leaves-queue ()
+  "A drawer missing a required property signals `user-error' and commits nothing."
+  (let ((original (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                               :start-col 0 :end-col 0
+                               :instruction "x" :lines (list "a")))))
+    (let ((claude-emacs-bridge--queue original))
+      (with-temp-buffer
+        (org-mode)
+        (insert "* broken entry\n:PROPERTIES:\n:SOURCE-FILE: /tmp/a.el\n:END:\n")
+        (insert "Instruction: whatever\n\n#+begin_src text\na\n#+end_src\n")
+        (should-error (claude-emacs-bridge-queue-buffer-commit) :type 'user-error)
+        (should (eq claude-emacs-bridge--queue original))))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/missing-instruction-line-signals-user-error ()
+  "An entry whose Instruction line is missing signals `user-error'."
+  (let ((original (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                               :start-col 0 :end-col 0
+                               :instruction "x" :lines (list "a")))))
+    (let ((claude-emacs-bridge--queue original))
+      (with-temp-buffer
+        (org-mode)
+        (insert (concat "* broken entry\n:PROPERTIES:\n:SOURCE-FILE: /tmp/a.el\n"
+                         ":START-LINE: 1\n:END-LINE: 1\n:START-COL: 0\n"
+                         ":END-COL: 0\n:LINES: (\"a\")\n:END:\n"))
+        (insert "\n#+begin_src text\na\n#+end_src\n")
+        (should-error (claude-emacs-bridge-queue-buffer-commit) :type 'user-error)
+        (should (eq claude-emacs-bridge--queue original))))))
+
+(ert-deftest claude-emacs-bridge-show-queue-test/binds-commit-to-C-c-C-c ()
+  "The queue buffer binds `claude-emacs-bridge-queue-buffer-commit' on C-c C-c."
+  (let ((claude-emacs-bridge--queue
+         (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                      :start-col 0 :end-col 0
+                      :instruction "x" :lines (list "a"))))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (should (eq (key-binding (kbd "C-c C-c"))
+                        #'claude-emacs-bridge-queue-buffer-commit))))
+      (when buffer (kill-buffer buffer)))))
+
 ;; Combined message builders
 
 (defvar claude-emacs-bridge-tests--fixture-entries
