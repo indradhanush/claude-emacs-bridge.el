@@ -24,95 +24,60 @@ emacs -Q --batch -L . -L tests -l ert -l tests/claude-emacs-bridge-tests.el --ev
 
 There is no Makefile, build step, or package manager config. The suite must
 also pass inside the running Doom Emacs instance (via `emacsclient`), because
-`vterm` and `persp-mode` only exist there.
+`persp-mode` only exists there.
 
 ## Architecture
 
-Everything lives in `claude-emacs-bridge.el`. Three concerns are worth knowing
-before editing.
+Everything lives in `claude-emacs-bridge.el`. A few mechanics are worth
+knowing before editing.
 
-### The coordinator is a vterm running Claude Code
+### The receipt socket
 
-`claude-emacs-bridge-start` opens a vterm named `*claude-emacs-server*` and
-types a startup command into it. That session runs under the name
-`emacs-server` and is started with `env -u DO_NOT_TRACK`, because Claude Code
-disables cross-session messaging when `DO_NOT_TRACK` is set and Emacs sets it
-globally.
+Delivery is one-way to the target's inbox socket, so the bridge binds its own
+socket to hear back about failures. `claude-emacs-bridge--ensure-receipt-socket`
+binds it once, named with the Emacs PID (`emacs-bridge-<pid>.sock`) under
+`claude-emacs-bridge-socket-directory`, and keeps it for the life of the
+Emacs session — a socket that only lived for one send would miss a drop frame
+that arrives batched, seconds later.
 
-Emacs cannot call `SendMessage` itself. That tool belongs to the model. So the
-bridge writes a natural-language prompt into the coordinator's vterm, and the
-coordinator model relays the payload to the target session. The prompt wraps
-the payload in `BEGIN TARGET MESSAGE` / `END TARGET MESSAGE` markers and tells
-the coordinator not to act on it. Changing that wording changes runtime
-behavior — treat `claude-emacs-bridge--format-prompt` as protocol, not text.
+Every send is remembered in `claude-emacs-bridge--sends`, keyed by a message
+id, for `claude-emacs-bridge--send-record-ttl` seconds after it stops
+waiting. A failure frame that names an id still in that table is matched back
+to the file and lines it concerns; a frame naming nothing there is logged
+verbatim as uncorrelated evidence of a failure nobody has seen yet.
 
-The buffer-local `claude-emacs-bridge--coordinator-p` flag marks a vterm the
-package created. A buffer with the right name but without the flag is a name
-collision and is rejected, never reused or killed.
+### Confirming delivery
 
-### The coordinator must not read files
+Nothing is written back on the socket connection itself, so a send cannot
+learn from the connection whether the target queued it. Confirmation instead
+comes from watching the target's own transcript file for the
+`queue-operation`/`enqueue` entry it writes once a message clears its accept,
+duplicate, and rate guards (`claude-emacs-bridge--await-enqueue`), bounded by
+`claude-emacs-bridge-confirm-timeout`. The transcript path is resolved from
+the session's working directory and id, with a wildcard fallback for when
+`claude-emacs-bridge-projects-directory` has been overridden; a transcript
+that still can't be found is not treated as a failure, since persistence can
+simply be off.
 
-Claude Code expands `@path` in the input box into an attached file *before the
-model runs*. That is not a tool call, so restricting the coordinator's tools
-does not stop it, and neither does telling it in the prompt not to read
-anything. A path inside an instruction meant for another session was being read
-by the relay.
+### Reporting the outcome
 
-Two independent guards, both needed.
-
-- The coordinator starts with a permission deny list. The docs state that
-  `Read` rules apply to `@file` mentions, and that is the only supported
-  mechanism that stops the attach. Deny beats allow from every scope, so a
-  user's own settings cannot re-enable it. `--tools` and `--strict-mcp-config`
-  narrow the relay to the messaging tools; without `--strict-mcp-config` every
-  configured MCP tool stays available.
-- `claude-emacs-bridge--escape-mentions` rewrites `@` to `\@` in the
-  instruction before it is pasted, so no expansion is attempted at all. The
-  escape is undocumented behaviour found by testing, which is why it is the
-  second guard and not the first.
-
-The target's own `@<name>` in the relay prompt is deliberately left unescaped;
-that is what routes the message.
-
-### Submitting a paste is a race
-
-Emacs pastes the prompt and then sends RET. Claude Code needs a moment to turn a
-bracketed paste into its pending-input widget, and a RET that arrives first is
-swallowed, leaving the message unsent as `[5 lines pasted]` in the input box.
-Byte ordering is not the problem: `Fvterm_update` flushes to the pty
-synchronously (`vterm-module.c:900`), so RET cannot overtake the paste.
-
-`claude-emacs-bridge--await-submit` recovers from this. It watches the tail of
-the coordinator buffer for the paste placeholder and resends RET while the
-placeholder is still there, bounded by
-`claude-emacs-bridge-submit-max-resends`. There is no fixed delay anywhere, on
-purpose: no published delay value is known to work.
-
-- Only the last `claude-emacs-bridge--paste-tail-window` characters are
-  searched. A wider search picks up placeholders in the scrollback from
-  messages that were already sent.
-- `claude-emacs-bridge-paste-placeholder-regexp` matches third-party UI text and
-  is a user option for that reason. If sends start going missing again with
-  nothing in the log buffer, check this first: a wording change in Claude Code
-  turns the detector into a no-op.
-
-A send now reports success only when the input box actually cleared. Otherwise
-it logs `may not have been submitted` to the log buffer.
+`claude-emacs-bridge--send-outcome` decides `delivered`, `unconfirmed`, or
+`failed` from two independent signals: whether a receipt frame arrived on the
+socket above, and whether the transcript confirmed queueing. A frame is
+checked first because it carries the recipient's own reason, and the two are
+never both true in practice — a message that was held or dropped was never
+queued. A `duplicate` drop is reported as ordinary, not a failure: it is the
+expected result of resending the same instruction about the same lines within
+the recipient's own duplicate window.
 
 ### Session discovery and routing
 
-Targets come from `claude agents --json`, parsed into alists. The coordinator
-is excluded by comparing the JSON `pid` against the vterm subprocess PID.
-Filtering by name is not reliable: Claude Code renames sessions when names
-collide.
-
-Only rows whose `kind` is `interactive` are kept. Interactive sessions are the
-only ones that bind an inbox socket in `/tmp/cc-socks/`, so they are the only
-ones the coordinator can deliver to. The same listing also returns background
-agents, which carry a name and sometimes a live pid, and a pid-and-name test
-cannot tell the two apart. A row that does not say it is interactive is
-dropped, so a change to the listing shape empties the picker instead of
-offering a target that silently goes nowhere.
+Targets come from `claude-emacs-bridge-registry-directory`, where Claude Code
+writes one JSON file per session. `claude-emacs-bridge--registry-row` keeps a
+row only when it can actually be delivered to and located later: it must name
+an inbox socket that still exists on disk (the socket going away is the
+cheapest sign the session that wrote the row has too), and carry a name, a
+PID, a session id, and a working directory.
 
 Each Emacs context gets one remembered target, held in the in-memory
 `claude-emacs-bridge--targets` hash table. Associations do not survive an Emacs
@@ -125,7 +90,7 @@ restart. The context key is the first of these that resolves, as a
 4. `directory` – `default-directory`
 
 A stored target is a `(pid . startedAt)` pair, not a name. A session that no
-longer appears in discovery is stale, and the next send prompts for a
+longer appears in the registry is stale, and the next send prompts for a
 replacement.
 
 ### Line ranges
@@ -140,8 +105,10 @@ narrowing does not shift the reported numbers.
 - Public symbols use the `claude-emacs-bridge-` prefix. Internal ones use
   `claude-emacs-bridge--`.
 - External functions are declared with `declare-function`, not required at load
-  time, so the package byte-compiles without `vterm` or `persp-mode` present.
+  time, so the package byte-compiles without `persp-mode` present.
 - Every helper has a direct ERT test. Tests fake collaborators with `cl-letf`
-  over `symbol-function`; nothing in the suite spawns a real process or vterm.
+  over `symbol-function`; nothing in the suite spawns a real process, aside
+  from the opt-in `claude-emacs-bridge-live-test`, skipped unless explicitly
+  enabled.
 - Plans live under `plans/` as org files and record acceptance criteria and
   verified facts. Update the relevant plan when behavior changes.
