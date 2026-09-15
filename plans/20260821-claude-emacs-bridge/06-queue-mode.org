@@ -1,0 +1,243 @@
+:PROPERTIES:
+:STATUS: DRAFT
+:STATUS_UPDATED_ON: 2026-09-15
+:END:
+#+title: Queue Mode
+#+date: 2026-09-15
+
+* Objective
+
+Add a queue: selections and instructions accumulate in memory instead of
+being sent immediately, and go out together on demand as one combined
+message. Orthogonal to the existing relay/socket transport choice — queue
+mode decides *when* a send happens, the transport still decides *how*.
+
+Nothing about the existing single-send path changes when queue mode is off.
+
+* State
+
+- =claude-emacs-bridge-queue-mode= :: global boolean, off by default.
+- =claude-emacs-bridge--queue= :: list of plists, oldest first. Each entry:
+  =:file :start-line :end-line :start-col :end-col :instruction :lines=.
+  =:lines= is the snippet text captured at queue time, kept only so
+  =claude-emacs-bridge-show-queue= has something to display. It is never
+  part of what gets sent — =claude-emacs-bridge-send-queue= sends
+  coordinates only, matching the "source text is never sent" rule the
+  single-send path already follows.
+
+* Commands
+
+- =claude-emacs-bridge-toggle-queue-mode= :: flips the flag, reports the new
+  state and the current queue length. The queue itself is never touched by
+  disabling. Turning it back *on* while the queue is non-empty asks whether
+  to clear the old entries first (=y-or-n-p=); either answer still
+  completes the toggle, the question only decides whether =--queue= is
+  emptied first. Turning it on with an empty queue, or off in either
+  direction, asks nothing.
+- =claude-emacs-bridge-send= (existing) :: when queue mode is on, builds an
+  entry and pushes it instead of dispatching to a transport. Message:
+  ="Queued (%d): %s lines %d-%d"=. No target is resolved at queue time —
+  that stays deferred to flush, same as today's single send resolves it
+  per call.
+- =claude-emacs-bridge-show-queue= :: pops an =org-mode= buffer,
+  =*Claude Bridge Queue*=, rendering every entry. See [[*Example Output]].
+- =claude-emacs-bridge-send-queue= :: =user-error= when the queue is empty.
+  Otherwise resolves one target the same way a single send does, builds one
+  combined message via whichever transport is active, and dispatches it.
+  The queue clears only once the message was actually sent — never on a
+  declined coordinator, a socket write that could not reach the target, or
+  any other failure that means nothing went out. An unconfirmed *delivery*
+  still clears the queue (matching the single-send path, which does not
+  retry on an unconfirmed result), because in that case the bytes did
+  leave; what is unconfirmed is only whether the recipient accepted them.
+  The distinction is "did we hand it off", not "did the recipient confirm
+  it".
+
+No clear-without-sending command in this pass. Add one later if it turns
+out to be needed.
+
+* Combined Message Format
+
+One new builder per transport, each folding N entries into a single
+prompt/frame. Both reuse the per-entry line already produced by the
+existing single-entry builders rather than duplicating the field
+formatting.
+
+** Socket
+
+#+begin_example
+Entry 1
+File: /abs/a.el
+Lines: 12-40
+Columns: 4-10
+Instruction: fix the off-by-one here
+
+Entry 2
+File: /abs/b.el
+Lines: 5-5
+Columns: 0-20
+Instruction: this needs a docstring
+#+end_example
+
+One frame, one =msg_id=, this text as its =content=.
+
+** Relay
+
+Same body, wrapped the way =--format-prompt= wraps a single entry today:
+one =SendMessage= instruction, one =BEGIN TARGET MESSAGE= /
+=END TARGET MESSAGE= pair around all N entries. At-mention escaping applies
+per instruction, same as today.
+
+* Truncation
+
+=claude-emacs-bridge--truncate-lines=: given the captured snippet as a list
+of strings and the buffer's starting line number:
+
+- 10 lines or fewer: show all, each prefixed with its absolute line number.
+- More than 10: show the first 5 and the last 5, each prefixed with its
+  line number, with a marker line between them naming how many lines were
+  omitted. Never more than 10 content lines shown, regardless of region
+  size.
+
+* Language For The Src Block
+
+A small extension-to-babel-language alist (=.el= -> =emacs-lisp=, =.py= ->
+=python=, =.go= -> =go=, =.js=/=.jsx= -> =js=, =.ts=/=.tsx= ->
+=typescript=, =.sh= -> =bash=, =.rb= -> =ruby=, =.rs= -> =rust=,
+=.c=/=.h= -> =C=), falling back to =text= for anything unrecognized.
+
+* Example Output
+
+Two queued entries: one 15-line region (truncated), one 4-line region
+(shown in full).
+
+#+begin_example
+* claude-emacs-bridge.el (lines 100-114, cols 0-40)
+Instruction: fix the off-by-one here
+
+#+begin_src emacs-lisp
+100: (defun claude-emacs-bridge--example (x)
+101:   "Docstring line one."
+102:   "Docstring line two."
+103:   (let ((y (+ x 1)))
+104:     (foo y)
+... (5 lines omitted) ...
+110:     (bar y)
+111:     (baz y)
+112:     y))
+113:
+114: (provide 'example)
+#+end_src
+
+* other-file.py (lines 40-43, cols 4-12)
+Instruction: this needs a docstring
+
+#+begin_src python
+40: def helper(a, b):
+41:     total = a + b
+42:     return total
+43:
+#+end_src
+#+end_example
+
+* Tasks
+
+** TODO Add state and the toggle command
+Add =claude-emacs-bridge-queue-mode= and =claude-emacs-bridge--queue=. Add
+=claude-emacs-bridge-toggle-queue-mode=.
+
+Test: toggling off never touches =--queue=, even when non-empty; toggling
+on with an empty queue asks nothing; toggling on with a non-empty queue
+prompts, and the toggle completes either way — a "no" answer leaves
+=--queue= intact and mode on, a "yes" answer empties =--queue= and leaves
+mode on. The report names the current queue length.
+
+** TODO Route =claude-emacs-bridge-send= into the queue
+When queue mode is on, capture an entry (including the snippet text) and
+push it instead of calling either transport. Off keeps today's behavior
+unchanged.
+
+Test: queue mode on appends an entry with the right fields and does not
+call either transport function; queue mode off is untouched (existing
+tests keep passing).
+
+** TODO Truncation and language mapping
+Add =claude-emacs-bridge--truncate-lines= and the extension-to-language
+helper. Both pure.
+
+Test: 7 lines shows all 7; exactly 10 shows all 10; 11 and 15 lines each
+truncate to first 5 + marker + last 5 with correct line numbers; unknown
+extension falls back to =text=; each mapped extension resolves correctly.
+
+** TODO =claude-emacs-bridge-show-queue=
+Build the org buffer from =--queue= using the truncation and language
+helpers. Empty queue shows a buffer saying so rather than erroring.
+
+Test: buffer major mode is =org-mode=; content matches the shape in
+[[*Example Output]] for a fixture queue of one truncated and one
+full-length entry; empty queue renders without error.
+
+** TODO Combined message builders
+Add the socket and relay combined-content builders, reusing the existing
+per-entry field formatting. Pure functions, no I/O.
+
+Test: N-entry socket content matches the =Entry k= shape above; relay
+content wraps the same body in the existing markers and instruction; an
+=@path= inside one entry's instruction is escaped on the relay builder and
+not on the socket builder, matching today's single-entry rule.
+
+** TODO =claude-emacs-bridge-send-queue=
+Resolve target, dispatch through the active transport with the combined
+builder. Each combined-send function (=--send-combined-via-socket=,
+=--send-combined-via-relay=) reports back, by its return value, whether the
+message actually went out — not merely whether the call returned without
+signalling. =send-queue= clears =--queue= only when that report is
+truthy. No =unwind-protect=: an exception propagating out of the dispatch
+call means the queue was never confirmed sent, so it must survive
+untouched for a retry, and the error still reaches the user normally.
+
+- =--send-combined-via-socket= :: returns non-nil once =--write-frame=
+  returns without signalling (the frame left this Emacs), nil when it
+  catches a =file-error= (socket unreachable — nothing was sent).
+- =--send-combined-via-relay= :: returns nil when the coordinator is
+  unavailable and starting it is declined (nothing was ever typed into
+  it), non-nil once the prompt was pasted and RET sent — whether or not
+  =--await-submit= confirms the paste cleared. An unconfirmed *submission*
+  still means the text left Emacs for the coordinator, which is enough to
+  count as sent for this purpose, matching how the single-send relay path
+  already treats "unconfirmed" as an attempt it does not retry.
+
+Test: empty queue signals =user-error=; a successful dispatch resolves a
+target once, sends the combined content, and clears =--queue=; a declined
+relay coordinator leaves =--queue= intact and reports nothing was sent; a
+socket =file-error= leaves =--queue= intact; an unexpected exception from
+the dispatch call propagates as an error and leaves =--queue= intact.
+
+* Testing
+
+Per =CLAUDE.md=, every new helper gets a direct ERT test, faking
+collaborators with =cl-letf= over =symbol-function=; nothing here spawns a
+process or vterm.
+
+* Decisions
+
+- 2026-09-15 :: Queue mode is an orthogonal toggle, not a third transport.
+  It only changes when a send happens; relay vs. socket still decides how.
+- 2026-09-15 :: A flush sends one combined message, not N individual sends.
+- 2026-09-15 :: The combined send carries coordinates only, never the
+  captured snippet text — consistent with the existing "source text is
+  never sent" rule.
+- 2026-09-15 :: The queue clears only once a flush actually sent the
+  message — a declined coordinator or an unreachable socket must not lose
+  it. An unconfirmed *delivery* still clears (the bytes left), matching
+  the single-send path's no-retry rule for that case specifically.
+- 2026-09-15 :: No clear-without-sending command in this pass.
+- 2026-09-15 :: Disabling queue mode never clears =--queue=. Re-enabling it
+  while entries remain asks whether to clear them, but the toggle itself
+  is never blocked on that answer — the user's call, either way, still
+  completes the toggle.
+
+* Next Steps
+
+- [ ] Start on the state and toggle command, TDD per task above, in task
+  order.
