@@ -113,6 +113,18 @@ Separate from `claude-emacs-bridge-preferred-transport' on purpose.  This
 says what is bound; the option says what was chosen.  Setting an option
 cannot release a coordinator vterm, so the two cannot be one variable.")
 
+(defvar claude-emacs-bridge-queue-mode nil
+  "Non-nil when `claude-emacs-bridge-send' queues instead of sending.
+Orthogonal to the delivery mode: this decides when a send happens, not how
+it is delivered.  Toggle with `claude-emacs-bridge-toggle-queue-mode'.")
+
+(defvar claude-emacs-bridge--queue nil
+  "Queued entries awaiting `claude-emacs-bridge-send-queue', oldest first.
+Each entry is a plist with :file :start-line :end-line :start-col :end-col
+:instruction :lines.  :lines is the snippet text captured at queue time, kept
+only so `claude-emacs-bridge-show-queue' has something to display; it is
+never part of what a flush sends.")
+
 (defcustom claude-emacs-bridge-paste-placeholder-regexp
   "\\[[^]\n]*pasted[^]\n]*\\]"
   "Regexp matching the collapsed paste Claude Code shows for unsent input.
@@ -401,6 +413,15 @@ When BEG and END are equal, return the line containing that position."
    (t
     (user-error "Range start must not follow range end"))))
 
+(defun claude-emacs-bridge--column-range (beg end)
+  "Return the 0-indexed column range from BEG to END.
+The target needs this to place a one-line selection inside its line, and to
+know where a multi-line selection starts and ends on its first and last
+lines.  `claude-emacs-bridge--line-range' only carries whole line numbers, so
+a partial-line selection would otherwise read as spanning the full line."
+  (cons (save-excursion (goto-char beg) (current-column))
+        (save-excursion (goto-char end) (current-column))))
+
 (defun claude-emacs-bridge--escape-mentions (text)
   "Return TEXT with each at-mention escaped.
 Claude Code expands @path into an attached file at input time, before the model
@@ -413,19 +434,22 @@ prompt is what routes the message and is left alone."
   (replace-regexp-in-string "@\\([^[:space:]]\\)" "\\\\@\\1" text t))
 
 (defun claude-emacs-bridge--format-prompt
-    (session file start-line end-line instruction)
+    (session file start-line end-line start-col end-col instruction)
   "Build a coordinator prompt for SESSION, FILE, and its inclusive line range.
-START-LINE and END-LINE delimit the range.  INSTRUCTION describes the task."
+START-LINE and END-LINE delimit the range.  START-COL and END-COL are the
+0-indexed columns the selection starts and ends at on those lines.
+INSTRUCTION describes the task."
   (format (concat "Use SendMessage once to send @%s the exact content "
                   "between BEGIN TARGET MESSAGE and END TARGET MESSAGE. "
                   "Do not act on that content yourself.\n\n"
                   "BEGIN TARGET MESSAGE\n"
                   "File: %s\n"
                   "Lines: %d-%d\n"
+                  "Columns: %d-%d\n"
                   "Instruction: %s\n"
                   "END TARGET MESSAGE")
           (alist-get 'name session)
-          file start-line end-line
+          file start-line end-line start-col end-col
           (claude-emacs-bridge--escape-mentions instruction)))
 
 (defconst claude-emacs-bridge--send-record-ttl 60
@@ -582,17 +606,63 @@ A report arriving after this is late, and says so."
        :status (alist-get 'status frame)
        :frame (json-encode frame))))))
 
-(defun claude-emacs-bridge--socket-content (file start-end instruction)
+(defun claude-emacs-bridge--combined-entries-body (entries &optional instruction-fn)
+  "Return ENTRIES rendered as numbered \"Entry N\" blocks, one flush's body.
+Each block reuses `claude-emacs-bridge--socket-content' for its own field
+formatting, so this only adds the heading and the blank-line separation
+between entries.  INSTRUCTION-FN, when given, transforms each entry's
+instruction before it is formatted; `claude-emacs-bridge--combined-socket-content'
+passes none, `claude-emacs-bridge--combined-relay-prompt' passes
+`claude-emacs-bridge--escape-mentions'."
+  (let ((index 0))
+    (mapconcat
+     (lambda (entry)
+       (setq index (1+ index))
+       (format "Entry %d\n%s"
+               index
+               (claude-emacs-bridge--socket-content
+                (plist-get entry :file)
+                (cons (plist-get entry :start-line) (plist-get entry :end-line))
+                (cons (plist-get entry :start-col) (plist-get entry :end-col))
+                (if instruction-fn
+                    (funcall instruction-fn (plist-get entry :instruction))
+                  (plist-get entry :instruction)))))
+     entries "\n\n")))
+
+(defun claude-emacs-bridge--combined-socket-content (entries)
+  "Return the combined socket content for ENTRIES, one queue flush's payload."
+  (claude-emacs-bridge--combined-entries-body entries))
+
+(defun claude-emacs-bridge--combined-relay-prompt (session entries)
+  "Build a coordinator prompt for SESSION carrying all of ENTRIES as one message.
+Wraps the same per-entry body `claude-emacs-bridge--combined-socket-content'
+builds, the way `claude-emacs-bridge--format-prompt' wraps a single entry: one
+SendMessage instruction, one BEGIN TARGET MESSAGE / END TARGET MESSAGE pair
+around all of ENTRIES.  Each entry's instruction is escaped independently."
+  (format (concat "Use SendMessage once to send @%s the exact content "
+                  "between BEGIN TARGET MESSAGE and END TARGET MESSAGE. "
+                  "Do not act on that content yourself.\n\n"
+                  "BEGIN TARGET MESSAGE\n"
+                  "%s\n"
+                  "END TARGET MESSAGE")
+          (alist-get 'name session)
+          (claude-emacs-bridge--combined-entries-body
+           entries #'claude-emacs-bridge--escape-mentions)))
+
+(defun claude-emacs-bridge--socket-content (file start-end col-range instruction)
   "Return the text a target receives for FILE over START-END, with INSTRUCTION.
-Nothing wraps it.  The relay has to talk a model into forwarding a payload,
-which is why it needs a preamble and markers.  A socket message is delivered
-by address, so it carries only what the target needs to act on.
+COL-RANGE gives the 0-indexed columns the selection starts and ends at on
+those lines.  Nothing wraps it.  The relay has to talk a model into forwarding
+a payload, which is why it needs a preamble and markers.  A socket message is
+delivered by address, so it carries only what the target needs to act on.
 
 At-mentions are deliberately left alone.  `claude-emacs-bridge--escape-mentions'
 exists because the relay types into an input box, where Claude Code turns an
 @path into an attached file before the model runs.  Nothing is typed here."
-  (format "File: %s\nLines: %d-%d\nInstruction: %s"
-          file (car start-end) (cdr start-end) instruction))
+  (format "File: %s\nLines: %d-%d\nColumns: %d-%d\nInstruction: %s"
+          file (car start-end) (cdr start-end)
+          (car col-range) (cdr col-range)
+          instruction))
 
 (defun claude-emacs-bridge--uds-address (socket)
   "Return the address a recipient can reach back on, for SOCKET."
@@ -939,10 +1009,141 @@ and then deliver to it precisely."
            (format "Delivery mode changed from %s to %s" active transport))
           (message "Delivery mode is now %s" transport))))))
 
+(defun claude-emacs-bridge-toggle-queue-mode ()
+  "Toggle whether `claude-emacs-bridge-send' queues instead of sending.
+Disabling never touches `claude-emacs-bridge--queue'.  Enabling while the
+queue already holds entries asks whether to clear them first; either answer
+still completes the toggle, the question only decides whether the queue is
+emptied before the mode goes on."
+  (interactive)
+  (if claude-emacs-bridge-queue-mode
+      (setq claude-emacs-bridge-queue-mode nil)
+    (when (and claude-emacs-bridge--queue
+               (y-or-n-p "Queue mode has queued entries; clear them? "))
+      (setq claude-emacs-bridge--queue nil))
+    (setq claude-emacs-bridge-queue-mode t))
+  (message "Queue mode is now %s (%d queued)"
+           (if claude-emacs-bridge-queue-mode "on" "off")
+           (length claude-emacs-bridge--queue)))
+
+(defconst claude-emacs-bridge--language-alist
+  '(("el" . "emacs-lisp") ("py" . "python") ("go" . "go")
+    ("js" . "js") ("jsx" . "js")
+    ("ts" . "typescript") ("tsx" . "typescript")
+    ("sh" . "bash") ("rb" . "ruby") ("rs" . "rust")
+    ("c" . "C") ("h" . "C"))
+  "Maps a file extension, without its dot, to a Babel source block language.
+Used by `claude-emacs-bridge-show-queue' to pick the language a queued
+entry's snippet is rendered under.")
+
+(defun claude-emacs-bridge--babel-language (file)
+  "Return the Babel language for FILE's extension, or \"text\" when unknown."
+  (or (cdr (assoc (downcase (or (file-name-extension file) ""))
+                   claude-emacs-bridge--language-alist))
+      "text"))
+
+(defun claude-emacs-bridge--truncate-lines (lines start-line)
+  "Return LINES, captured starting at START-LINE, as numbered rows to display.
+LINES is a list of strings, as `claude-emacs-bridge--capture-lines' returns.
+Each row is a cons of an absolute line number and its text.  Ten lines or
+fewer are all returned.  More than ten returns the first five and the last
+five, with a marker row (a nil line number) between them naming how many
+lines were omitted.  Never more than ten content rows come back, regardless
+of how many LINES holds."
+  (let* ((count (length lines))
+         (numbered (let ((n (1- start-line)))
+                     (mapcar (lambda (line) (cons (setq n (1+ n)) line)) lines))))
+    (if (<= count 10)
+        numbered
+      (append (cl-subseq numbered 0 5)
+              (list (cons nil (format "... (%d lines omitted) ..." (- count 10))))
+              (cl-subseq numbered (- count 5) count)))))
+
+(defun claude-emacs-bridge--capture-lines (start-line end-line)
+  "Return the current buffer's text from START-LINE through END-LINE.
+Result is a list of strings, one per line, for `claude-emacs-bridge-show-queue'
+to display later.  Absolute line numbers are used, via widening, so a
+narrowed buffer does not shift what is captured."
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char (point-min))
+      (forward-line (1- start-line))
+      (let ((beg (point)))
+        (goto-char (point-min))
+        (forward-line (1- end-line))
+        (end-of-line)
+        (split-string (buffer-substring-no-properties beg (point)) "\n")))))
+
+(defun claude-emacs-bridge--enqueue-send (range col-range file instruction)
+  "Push a queue entry for FILE covered by RANGE and COL-RANGE, with INSTRUCTION.
+RANGE and COL-RANGE are inclusive line and 0-indexed column conses, as
+`claude-emacs-bridge--line-range' and `claude-emacs-bridge--column-range'
+return.  Operates on the current buffer, to capture its snippet text for
+`claude-emacs-bridge-show-queue'.  No target is resolved here; that stays
+deferred to `claude-emacs-bridge-send-queue'."
+  (let ((entry (list :file file
+                      :start-line (car range)
+                      :end-line (cdr range)
+                      :start-col (car col-range)
+                      :end-col (cdr col-range)
+                      :instruction instruction
+                      :lines (claude-emacs-bridge--capture-lines
+                              (car range) (cdr range)))))
+    (setq claude-emacs-bridge--queue
+          (append claude-emacs-bridge--queue (list entry)))
+    (message "Queued (%d): %s lines %d-%d"
+             (length claude-emacs-bridge--queue)
+             file (car range) (cdr range))
+    entry))
+
+(defun claude-emacs-bridge--format-queue-entry (entry)
+  "Return the org text rendering one queue ENTRY."
+  (let* ((file (plist-get entry :file))
+         (start-line (plist-get entry :start-line))
+         (end-line (plist-get entry :end-line))
+         (start-col (plist-get entry :start-col))
+         (end-col (plist-get entry :end-col))
+         (instruction (plist-get entry :instruction))
+         (rows (claude-emacs-bridge--truncate-lines
+                (plist-get entry :lines) start-line)))
+    (concat
+     (format "* %s (lines %d-%d, cols %d-%d)\n"
+             (file-name-nondirectory file) start-line end-line start-col end-col)
+     (format "Instruction: %s\n\n" instruction)
+     (format "#+begin_src %s\n" (claude-emacs-bridge--babel-language file))
+     (mapconcat
+      (lambda (row)
+        (if (car row) (format "%d: %s" (car row) (cdr row)) (cdr row)))
+      rows "\n")
+     "\n#+end_src\n")))
+
+(defun claude-emacs-bridge-show-queue ()
+  "Display the queued entries in an org-mode buffer.
+Each entry is rendered as its own heading, with the snippet captured at queue
+time shown in a source block, truncated by `claude-emacs-bridge--truncate-lines'.
+An empty queue shows a buffer saying so, rather than erroring."
+  (interactive)
+  (let ((buffer (get-buffer-create "*Claude Bridge Queue*")))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (if claude-emacs-bridge--queue
+            (insert (mapconcat #'claude-emacs-bridge--format-queue-entry
+                                claude-emacs-bridge--queue "\n"))
+          (insert "Queue is empty.\n")))
+      (org-mode))
+    (pop-to-buffer buffer)
+    buffer))
+
 (defun claude-emacs-bridge-send (beg end instruction)
   "Send the file location from BEG to END to the coordinator.
 Equal endpoints send their current line.  INSTRUCTION tells the target Claude
-Code session what to do.  Source text is not sent."
+Code session what to do.  Source text is not sent.
+
+When `claude-emacs-bridge-queue-mode' is on, the location and instruction are
+queued instead of being sent; flush the queue with
+`claude-emacs-bridge-send-queue'."
   (interactive
    (progn
      (unless buffer-file-name
@@ -959,14 +1160,17 @@ Code session what to do.  Source text is not sent."
   ;; is resolved, so nobody picks a target for a mode they have not chosen.
   (let* ((mode (claude-emacs-bridge--ensure-mode))
          (range (claude-emacs-bridge--line-range beg end))
+         (col-range (claude-emacs-bridge--column-range beg end))
          (file (expand-file-name buffer-file-name))
          (source-buffer (current-buffer)))
-    (pcase mode
-      ('relay (claude-emacs-bridge--send-via-relay
-               range file source-buffer instruction))
-      ('socket (claude-emacs-bridge--send-via-socket
-                range file source-buffer instruction))
-      (_ (user-error "Unknown delivery mode: %S" mode)))))
+    (if claude-emacs-bridge-queue-mode
+        (claude-emacs-bridge--enqueue-send range col-range file instruction)
+      (pcase mode
+        ('relay (claude-emacs-bridge--send-via-relay
+                 range col-range file source-buffer instruction))
+        ('socket (claude-emacs-bridge--send-via-socket
+                  range col-range file source-buffer instruction))
+        (_ (user-error "Unknown delivery mode: %S" mode))))))
 
 (defun claude-emacs-bridge--transcript-slug (cwd)
   "Return the directory name Claude Code files CWD's transcripts under."
@@ -1120,9 +1324,10 @@ never queued."
     (cons 'unconfirmed
           (format "Sent to %s: %s lines %s (unconfirmed)" target file lines)))))
 
-(defun claude-emacs-bridge--send-via-socket (range file source-buffer
-                                                   instruction)
+(defun claude-emacs-bridge--send-via-socket (range col-range file
+                                                   source-buffer instruction)
   "Deliver the location in FILE covered by RANGE to a target's inbox socket.
+COL-RANGE gives the 0-indexed columns the selection starts and ends at.
 SOURCE-BUFFER is where the target is resolved.  INSTRUCTION tells the target
 what to do.  The send is reported as unconfirmed: nothing is written back on
 the connection, so confirmation has to come from elsewhere."
@@ -1133,7 +1338,8 @@ the connection, so confirmation has to come from elsewhere."
          (lines (format "%d-%d" (car range) (cdr range)))
          (receipt (claude-emacs-bridge--ensure-receipt-socket))
          (id (claude-emacs-bridge--uuid))
-         (content (claude-emacs-bridge--socket-content file range instruction))
+         (content (claude-emacs-bridge--socket-content
+                   file range col-range instruction))
          (frame (claude-emacs-bridge--socket-frame
                  content id (claude-emacs-bridge--uds-address receipt))))
     (claude-emacs-bridge--log-send
@@ -1180,9 +1386,10 @@ the connection, so confirmation has to come from elsewhere."
        (message "Could not reach %s at %s: %s"
                 target socket (error-message-string err))))))
 
-(defun claude-emacs-bridge--send-via-relay (range file source-buffer
-                                                  instruction)
+(defun claude-emacs-bridge--send-via-relay (range col-range file
+                                                  source-buffer instruction)
   "Send the location in FILE covered by RANGE through the coordinator.
+COL-RANGE gives the 0-indexed columns the selection starts and ends at.
 SOURCE-BUFFER is the buffer the range came from, and it is where the target
 is resolved.  INSTRUCTION tells the target session what to do."
   (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
@@ -1196,6 +1403,8 @@ is resolved.  INSTRUCTION tells the target session what to do."
              file
              (car range)
              (cdr range)
+             (car col-range)
+             (cdr col-range)
              instruction)))
       ;; The prompt is logged rather than the instruction: what went out is
       ;; what a later reader needs, wrapper and escaping included.
@@ -1220,6 +1429,93 @@ is resolved.  INSTRUCTION tells the target session what to do."
                        claude-emacs-bridge-buffer-name)))
           (claude-emacs-bridge--log-outcome send-id 'unconfirmed warning)
           (message "%s" warning))))))
+
+(defun claude-emacs-bridge--send-combined-via-socket (session entries)
+  "Deliver ENTRIES to SESSION's inbox socket as one combined message.
+Mirrors `claude-emacs-bridge--send-via-socket', but for the combined content
+`claude-emacs-bridge--combined-socket-content' builds from all of ENTRIES.
+Returns non-nil once `claude-emacs-bridge--write-frame' returns without
+signalling (the frame left this Emacs), nil when it catches a `file-error'
+\(the socket was unreachable, so nothing was sent)."
+  (let* ((socket (alist-get 'messagingSocketPath session))
+         (target (alist-get 'name session))
+         (receipt (claude-emacs-bridge--ensure-receipt-socket))
+         (id (claude-emacs-bridge--uuid))
+         (content (claude-emacs-bridge--combined-socket-content entries))
+         (frame (claude-emacs-bridge--socket-frame
+                 content id (claude-emacs-bridge--uds-address receipt))))
+    (claude-emacs-bridge--log-event
+     'send :id id :transport 'socket :target target
+     :pid (alist-get 'pid session) :entries (length entries)
+     :content content :socket socket
+     :frame (and claude-emacs-bridge-log-frames frame))
+    (condition-case err
+        (progn
+          (claude-emacs-bridge--write-frame socket frame)
+          (claude-emacs-bridge--log-outcome id 'sent)
+          (message "Sent %d queued entries to %s" (length entries) target)
+          t)
+      (file-error
+       (claude-emacs-bridge--log-outcome id 'failed (error-message-string err))
+       (message "Could not reach %s at %s: %s"
+                target socket (error-message-string err))
+       nil))))
+
+(defun claude-emacs-bridge--send-combined-via-relay (session entries)
+  "Send ENTRIES through the coordinator as one combined message to SESSION.
+Mirrors `claude-emacs-bridge--send-via-relay', but for the combined prompt
+`claude-emacs-bridge--combined-relay-prompt' builds from all of ENTRIES.
+Returns nil when the coordinator is unavailable and starting it is
+declined (nothing was ever typed into it), non-nil once the prompt was
+pasted and RET sent, whether or not `claude-emacs-bridge--await-submit'
+confirms the paste cleared: an unconfirmed submission still means the text
+left Emacs for the coordinator, which counts as sent here."
+  (when-let ((coordinator (claude-emacs-bridge--coordinator-buffer)))
+    (let* ((send-id (claude-emacs-bridge--uuid))
+           (prompt (claude-emacs-bridge--combined-relay-prompt session entries)))
+      (claude-emacs-bridge--log-event
+       'send :id send-id :transport 'relay :target (alist-get 'name session)
+       :entries (length entries) :content prompt)
+      (with-current-buffer coordinator
+        (vterm-send-string prompt t)
+        (vterm-send-return))
+      (if (claude-emacs-bridge--await-submit coordinator)
+          (progn
+            (claude-emacs-bridge--log-outcome send-id 'submitted)
+            (message "Sent %d queued entries to %s"
+                     (length entries) (alist-get 'name session)))
+        (let ((warning
+               (format "Message to %s may not have been submitted; check %s"
+                       (alist-get 'name session)
+                       claude-emacs-bridge-buffer-name)))
+          (claude-emacs-bridge--log-outcome send-id 'unconfirmed warning)
+          (message "%s" warning)))
+      t)))
+
+(defun claude-emacs-bridge-send-queue ()
+  "Send every queued entry to one target as a single combined message.
+Signals a `user-error' when the queue is empty.  Otherwise resolves one
+target the same way `claude-emacs-bridge-send' does, dispatches through the
+active delivery mode with the combined content, and clears the queue only
+once the dispatch function reports the message actually went out (a
+truthy return value), never merely because the call returned without
+signalling.  An exception propagating out of the dispatch call is not
+caught here: the queue was never confirmed sent, so it survives untouched
+for a retry, and the error still reaches the caller normally."
+  (interactive)
+  (unless claude-emacs-bridge--queue
+    (user-error "Queue is empty"))
+  (let* ((mode (claude-emacs-bridge--ensure-mode))
+         (entries claude-emacs-bridge--queue)
+         (session (claude-emacs-bridge--resolve-target))
+         (sent (pcase mode
+                 ('relay (claude-emacs-bridge--send-combined-via-relay
+                          session entries))
+                 ('socket (claude-emacs-bridge--send-combined-via-socket
+                           session entries))
+                 (_ (user-error "Unknown delivery mode: %S" mode)))))
+    (when sent
+      (setq claude-emacs-bridge--queue nil))))
 
 (provide 'claude-emacs-bridge)
 ;;; claude-emacs-bridge.el ends here

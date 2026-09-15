@@ -44,6 +44,30 @@
     (should (equal (claude-emacs-bridge--line-range (point) (point))
                    '(3 . 3)))))
 
+(ert-deftest claude-emacs-bridge--column-range-test/partial-selection-on-one-line ()
+  "A selection starting and ending mid-line reports both columns."
+  (with-temp-buffer
+    (insert "alpha beta\n")
+    (should (equal (claude-emacs-bridge--column-range 2 7)
+                   '(1 . 6)))))
+
+(ert-deftest claude-emacs-bridge--column-range-test/multi-line-selection ()
+  "A multi-line selection reports the column on its first and last lines."
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\n")
+    (should (equal (claude-emacs-bridge--column-range 2 10)
+                   '(1 . 1)))))
+
+(ert-deftest claude-emacs-bridge--column-range-test/empty-range-uses-point-column ()
+  "Equal endpoints report the column at point at both ends."
+  (with-temp-buffer
+    (insert "one\ntwo\n")
+    (goto-char (point-min))
+    (forward-line 1)
+    (forward-char 2)
+    (should (equal (claude-emacs-bridge--column-range (point) (point))
+                   '(2 . 2)))))
+
 (ert-deftest claude-emacs-bridge--normalize-directory-test/expands-and-adds-slash ()
   "Directory keys are absolute and end with a slash."
   (let ((default-directory "/tmp/"))
@@ -316,7 +340,7 @@ Claude Code decides what a mention is; the bridge does not try to outguess it."
   "An at-mention in the instruction reaches the target without being expanded."
   (let ((prompt (claude-emacs-bridge--format-prompt
                  '((name . "task-1"))
-                 "/tmp/example.go" 4 7
+                 "/tmp/example.go" 4 7 0 3
                  "inline it into @/tmp/download.sh")))
     (should (string-match-p "Instruction: inline it into \\\\@/tmp/download\\.sh"
                             prompt))))
@@ -325,7 +349,7 @@ Claude Code decides what a mention is; the bridge does not try to outguess it."
   "The target's own mention is left intact so the coordinator can still route."
   (let ((prompt (claude-emacs-bridge--format-prompt
                  '((name . "task-1"))
-                 "/tmp/example.go" 4 7 "Review these lines.")))
+                 "/tmp/example.go" 4 7 0 3 "Review these lines.")))
     (should (string-match-p "send @task-1 the exact content" prompt))
     (should-not (string-match-p "send \\\\@task-1" prompt))))
 
@@ -347,7 +371,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
           '((name . "task-1")
             (pid . 1)
             (sessionId . "11111111-1111-1111-1111-111111111111"))
-          "/tmp/example.go" 4 7 "Review these lines.")))
+          "/tmp/example.go" 4 7 0 3 "Review these lines.")))
     (should
      (equal prompt
             (concat "Use SendMessage once to send @task-1 the exact content "
@@ -356,6 +380,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
                     "BEGIN TARGET MESSAGE\n"
                     "File: /tmp/example.go\n"
                     "Lines: 4-7\n"
+                    "Columns: 0-3\n"
                     "Instruction: Review these lines.\n"
                     "END TARGET MESSAGE")))
     (should-not (string-match-p "selected text" prompt))))
@@ -532,6 +557,7 @@ can read is a relay that leaks whatever a path in an instruction points at."
                           "BEGIN TARGET MESSAGE\n"
                           "File: /tmp/example.go\n"
                           "Lines: 1-2\n"
+                          "Columns: 0-0\n"
                           "Instruction: Review these lines.\n"
                           "END TARGET MESSAGE")))
           (should-not (string-match-p "secret source text" sent-string))
@@ -819,8 +845,9 @@ can read is a relay that leaks whatever a path in an instruction points at."
         (claude-emacs-bridge-send (point-min) (point-min) "Look here.")))
     (should socket-args)
     (should (equal (nth 0 socket-args) '(1 . 1)))
-    (should (equal (nth 1 socket-args) "/tmp/example.go"))
-    (should (equal (nth 3 socket-args) "Look here."))))
+    (should (equal (nth 1 socket-args) '(0 . 0)))
+    (should (equal (nth 2 socket-args) "/tmp/example.go"))
+    (should (equal (nth 4 socket-args) "Look here."))))
 
 (ert-deftest claude-emacs-bridge-start-test/refuses-in-socket-mode ()
   "Starting the coordinator in socket mode names the active mode and the switch."
@@ -1079,7 +1106,7 @@ the picker, so it cannot reach a session someone is using."
             (should session)
             (should (equal (alist-get 'name session) name))
             (let* ((content (claude-emacs-bridge--socket-content
-                             "/tmp/live-check.go" '(1 . 2)
+                             "/tmp/live-check.go" '(1 . 2) '(0 . 0)
                              "This is an automated check. Do nothing."))
                    (id (claude-emacs-bridge--uuid))
                    (receipt (claude-emacs-bridge--ensure-receipt-socket))
@@ -1322,7 +1349,8 @@ It must not read as success, nor as a bug in the bridge, because it is neither."
                  (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
         (with-temp-buffer
           (claude-emacs-bridge--send-via-socket
-           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+           '(4 . 7) '(0 . 3) "/tmp/example.go" (current-buffer)
+           "Review these lines.")))
       (should (string-match-p "task-1" shown))
       (should-not (string-match-p "unconfirmed" shown))
       (with-current-buffer claude-emacs-bridge-log-buffer-name
@@ -1356,7 +1384,7 @@ It must not read as success, nor as a bug in the bridge, because it is neither."
                  (lambda (fmt &rest args) (setq shown (apply #'format fmt args)))))
         (with-temp-buffer
           (claude-emacs-bridge--send-via-socket
-           '(1 . 2) "/tmp/example.go" (current-buffer) "Look.")))
+           '(1 . 2) '(0 . 0) "/tmp/example.go" (current-buffer) "Look.")))
       (should (string-match-p "duplicate" shown))
       (with-current-buffer claude-emacs-bridge-log-buffer-name
         (should (string-match-p " outcome .*result=failed" (buffer-string)))))))
@@ -1581,7 +1609,8 @@ Reading from the noted offset is what keeps them apart."
                    (setq shown (apply #'format format-string args)))))
         (with-temp-buffer
           (claude-emacs-bridge--send-via-socket
-           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+           '(4 . 7) '(0 . 3) "/tmp/example.go" (current-buffer)
+           "Review these lines.")))
       (should (equal (car written) "/tmp/cc-socks/7.sock"))
       (should (string-match-p "\"type\":\"user\"" (cdr written)))
       (should (string-match-p "Review these lines\\." (cdr written)))
@@ -1604,7 +1633,8 @@ Reading from the noted offset is what keeps them apart."
                 ((symbol-function 'message) (lambda (&rest _) nil)))
         (with-temp-buffer
           (claude-emacs-bridge--send-via-socket
-           '(4 . 7) "/tmp/example.go" (current-buffer) "Review these lines.")))
+           '(4 . 7) '(0 . 3) "/tmp/example.go" (current-buffer)
+           "Review these lines.")))
       (should (= (hash-table-count claude-emacs-bridge--sends) 1))
       (maphash (lambda (_id record)
                  (should (equal (alist-get 'file record) "/tmp/example.go"))
@@ -1629,7 +1659,7 @@ Reading from the noted offset is what keeps them apart."
                    (setq shown (apply #'format format-string args)))))
         (with-temp-buffer
           (claude-emacs-bridge--send-via-socket
-           '(1 . 2) "/tmp/example.go" (current-buffer) "Look.")))
+           '(1 . 2) '(0 . 0) "/tmp/example.go" (current-buffer) "Look.")))
       (should (string-match-p "task-1" shown))
       (with-current-buffer claude-emacs-bridge-log-buffer-name
         (let ((text (buffer-string)))
@@ -1640,19 +1670,20 @@ Reading from the noted offset is what keeps them apart."
 
 ;;; The socket message
 
-(ert-deftest claude-emacs-bridge--socket-content-test/is-three-plain-lines ()
+(ert-deftest claude-emacs-bridge--socket-content-test/is-four-plain-lines ()
   "The socket content carries the location and the instruction, nothing else."
   (should
    (equal (claude-emacs-bridge--socket-content
-           "/tmp/example.go" '(12 . 40) "Review these lines.")
+           "/tmp/example.go" '(12 . 40) '(4 . 9) "Review these lines.")
           (concat "File: /tmp/example.go\n"
                   "Lines: 12-40\n"
+                  "Columns: 4-9\n"
                   "Instruction: Review these lines."))))
 
 (ert-deftest claude-emacs-bridge--socket-content-test/carries-no-relay-wrapper ()
   "Nothing the relay adds for a model to act on is carried over."
   (let ((content (claude-emacs-bridge--socket-content
-                  "/tmp/example.go" '(1 . 2) "Do the thing.")))
+                  "/tmp/example.go" '(1 . 2) '(0 . 0) "Do the thing.")))
     (should-not (string-match-p "BEGIN TARGET MESSAGE" content))
     (should-not (string-match-p "END TARGET MESSAGE" content))
     (should-not (string-match-p "SendMessage" content))
@@ -1663,7 +1694,7 @@ Reading from the noted offset is what keeps them apart."
 Escaping exists because the relay types into an input box.  Nothing is typed
 here, so the two message formats must not quietly converge."
   (let ((content (claude-emacs-bridge--socket-content
-                  "/tmp/example.go" '(1 . 2)
+                  "/tmp/example.go" '(1 . 2) '(0 . 0)
                   "inline it into @/tmp/download.sh")))
     (should (string-match-p "inline it into @/tmp/download\\.sh" content))
     (should-not (string-match-p "\\\\@" content))))
@@ -2188,6 +2219,433 @@ Same reason the relay path drops background agents."
       (when (get-buffer claude-emacs-bridge-log-buffer-name)
         (kill-buffer claude-emacs-bridge-log-buffer-name))
       (kill-buffer coordinator))))
+
+;; Queue mode
+
+(ert-deftest claude-emacs-bridge-toggle-queue-mode-test/off-never-touches-queue ()
+  "Turning queue mode off leaves a non-empty queue untouched."
+  (let ((claude-emacs-bridge-queue-mode t)
+        (claude-emacs-bridge--queue (list '(:file "/tmp/a.el"))))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (ert-fail "Disabling must not prompt")))
+              ((symbol-function 'message) #'ignore))
+      (claude-emacs-bridge-toggle-queue-mode))
+    (should-not claude-emacs-bridge-queue-mode)
+    (should (= (length claude-emacs-bridge--queue) 1))))
+
+(ert-deftest claude-emacs-bridge-toggle-queue-mode-test/on-with-empty-queue-asks-nothing ()
+  "Turning queue mode on with an empty queue prompts for nothing."
+  (let ((claude-emacs-bridge-queue-mode nil)
+        (claude-emacs-bridge--queue nil))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (ert-fail "Enabling on an empty queue must not prompt")))
+              ((symbol-function 'message) #'ignore))
+      (claude-emacs-bridge-toggle-queue-mode))
+    (should claude-emacs-bridge-queue-mode)
+    (should-not claude-emacs-bridge--queue)))
+
+(ert-deftest claude-emacs-bridge-toggle-queue-mode-test/on-with-entries-declining-keeps-them ()
+  "Declining the prompt on re-enable still turns the mode on, queue intact."
+  (let ((claude-emacs-bridge-queue-mode nil)
+        (claude-emacs-bridge--queue (list '(:file "/tmp/a.el"))))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+              ((symbol-function 'message) #'ignore))
+      (claude-emacs-bridge-toggle-queue-mode))
+    (should claude-emacs-bridge-queue-mode)
+    (should (= (length claude-emacs-bridge--queue) 1))))
+
+(ert-deftest claude-emacs-bridge-toggle-queue-mode-test/on-with-entries-accepting-clears-them ()
+  "Accepting the prompt on re-enable turns the mode on and empties the queue."
+  (let ((claude-emacs-bridge-queue-mode nil)
+        (claude-emacs-bridge--queue (list '(:file "/tmp/a.el"))))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'message) #'ignore))
+      (claude-emacs-bridge-toggle-queue-mode))
+    (should claude-emacs-bridge-queue-mode)
+    (should-not claude-emacs-bridge--queue)))
+
+(ert-deftest claude-emacs-bridge-toggle-queue-mode-test/reports-length ()
+  "The report names the queue length after the toggle."
+  (let ((claude-emacs-bridge-queue-mode nil)
+        (claude-emacs-bridge--queue (list '(:file "/tmp/a.el") '(:file "/tmp/b.el")))
+        (reported nil))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq reported (apply #'format format-string args)))))
+      (claude-emacs-bridge-toggle-queue-mode))
+    (should (string-match-p "2" reported))))
+
+;; Routing send into the queue
+
+(ert-deftest claude-emacs-bridge--capture-lines-test/returns-lines-in-range ()
+  "The captured snippet is exactly the lines the range covers."
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\nfour\n")
+    (should (equal (claude-emacs-bridge--capture-lines 2 3) '("two" "three")))))
+
+(ert-deftest claude-emacs-bridge--capture-lines-test/single-line ()
+  "A single-line range captures just that line."
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\n")
+    (should (equal (claude-emacs-bridge--capture-lines 2 2) '("two")))))
+
+(ert-deftest claude-emacs-bridge--capture-lines-test/narrowed-buffer-uses-absolute-lines ()
+  "Capture uses absolute line numbers, unaffected by narrowing."
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\nfour\n")
+    (goto-char (point-min))
+    (forward-line 2)
+    (narrow-to-region (point) (point-max))
+    (should (equal (claude-emacs-bridge--capture-lines 3 4) '("three" "four")))))
+
+(ert-deftest claude-emacs-bridge-send-test/queue-mode-appends-entry-and-skips-transport ()
+  "Queue mode on captures the entry instead of dispatching to a transport."
+  (let ((claude-emacs-bridge--mode 'relay)
+        (claude-emacs-bridge-queue-mode t)
+        (claude-emacs-bridge--queue nil)
+        (reported nil))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--send-via-relay)
+               (lambda (&rest _) (ert-fail "Queue mode must not dispatch to relay")))
+              ((symbol-function 'claude-emacs-bridge--send-via-socket)
+               (lambda (&rest _) (ert-fail "Queue mode must not dispatch to socket")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq reported (apply #'format format-string args)))))
+      (with-temp-buffer
+        (setq buffer-file-name "/tmp/example.go")
+        (insert "first\nsecond\nthird\n")
+        (set-buffer-modified-p nil)
+        (claude-emacs-bridge-send
+         (point-min)
+         (save-excursion (goto-char (point-min)) (forward-line 2) (point))
+         "Review these lines.")))
+    (should (= (length claude-emacs-bridge--queue) 1))
+    (let ((entry (car claude-emacs-bridge--queue)))
+      (should (equal (plist-get entry :file) "/tmp/example.go"))
+      (should (= (plist-get entry :start-line) 1))
+      (should (= (plist-get entry :end-line) 2))
+      (should (= (plist-get entry :start-col) 0))
+      (should (= (plist-get entry :end-col) 0))
+      (should (equal (plist-get entry :instruction) "Review these lines."))
+      (should (equal (plist-get entry :lines) '("first" "second"))))
+    (should (equal reported "Queued (1): /tmp/example.go lines 1-2"))))
+
+;; Truncation and language mapping
+
+(ert-deftest claude-emacs-bridge--truncate-lines-test/seven-lines-shows-all ()
+  "Seven lines is under the threshold, so every line is shown."
+  (let ((rows (claude-emacs-bridge--truncate-lines
+               '("a" "b" "c" "d" "e" "f" "g") 10)))
+    (should (equal rows '((10 . "a") (11 . "b") (12 . "c") (13 . "d")
+                          (14 . "e") (15 . "f") (16 . "g"))))))
+
+(ert-deftest claude-emacs-bridge--truncate-lines-test/exactly-ten-shows-all ()
+  "Exactly ten lines is still under the truncation threshold."
+  (let* ((lines (mapcar #'number-to-string (number-sequence 1 10)))
+         (rows (claude-emacs-bridge--truncate-lines lines 100)))
+    (should (= (length rows) 10))
+    (should (equal (car rows) '(100 . "1")))
+    (should (equal (car (last rows)) '(109 . "10")))))
+
+(ert-deftest claude-emacs-bridge--truncate-lines-test/eleven-lines-truncates ()
+  "Eleven lines truncates to first five, a marker, and last five."
+  (let* ((lines (mapcar #'number-to-string (number-sequence 1 11)))
+         (rows (claude-emacs-bridge--truncate-lines lines 100)))
+    (should (= (length rows) 11))
+    (should (equal (cl-subseq rows 0 5)
+                   '((100 . "1") (101 . "2") (102 . "3") (103 . "4") (104 . "5"))))
+    (should (equal (nth 5 rows) '(nil . "... (1 lines omitted) ...")))
+    (should (equal (cl-subseq rows 6 11)
+                   '((106 . "7") (107 . "8") (108 . "9") (109 . "10") (110 . "11"))))))
+
+(ert-deftest claude-emacs-bridge--truncate-lines-test/fifteen-lines-truncates ()
+  "Fifteen lines truncates the same way and never shows more than ten lines."
+  (let* ((lines (mapcar #'number-to-string (number-sequence 1 15)))
+         (rows (claude-emacs-bridge--truncate-lines lines 100)))
+    (should (= (length rows) 11))
+    (should (equal (cl-subseq rows 0 5)
+                   '((100 . "1") (101 . "2") (102 . "3") (103 . "4") (104 . "5"))))
+    (should (equal (nth 5 rows) '(nil . "... (5 lines omitted) ...")))
+    (should (equal (cl-subseq rows 6 11)
+                   '((110 . "11") (111 . "12") (112 . "13") (113 . "14") (114 . "15"))))
+    (should (= (cl-count-if #'car rows) 10))))
+
+(ert-deftest claude-emacs-bridge--babel-language-test/unknown-extension-falls-back-to-text ()
+  "An unrecognized extension renders as a plain text block."
+  (should (equal (claude-emacs-bridge--babel-language "/tmp/thing.xyz") "text")))
+
+(ert-deftest claude-emacs-bridge--babel-language-test/each-mapped-extension-resolves ()
+  "Every extension the plan lists resolves to its Babel language."
+  (dolist (case '(("a.el" . "emacs-lisp") ("a.py" . "python") ("a.go" . "go")
+                  ("a.js" . "js") ("a.jsx" . "js")
+                  ("a.ts" . "typescript") ("a.tsx" . "typescript")
+                  ("a.sh" . "bash") ("a.rb" . "ruby") ("a.rs" . "rust")
+                  ("a.c" . "C") ("a.h" . "C")))
+    (should (equal (claude-emacs-bridge--babel-language (car case)) (cdr case)))))
+
+;; claude-emacs-bridge-show-queue
+
+(ert-deftest claude-emacs-bridge-show-queue-test/renders-org-buffer ()
+  "The queue buffer is org-mode and matches the documented shape."
+  (let ((claude-emacs-bridge--queue
+         (list (list :file "/tmp/claude-emacs-bridge.el"
+                     :start-line 100 :end-line 114
+                     :start-col 0 :end-col 40
+                     :instruction "fix the off-by-one here"
+                     :lines (append
+                             (list "(defun claude-emacs-bridge--example (x)"
+                                   "  \"Docstring line one.\""
+                                   "  \"Docstring line two.\""
+                                   "  (let ((y (+ x 1)))"
+                                   "    (foo y)")
+                             (list "    (setq y y)" "    (setq y y)"
+                                   "    (setq y y)" "    (setq y y)"
+                                   "    (setq y y)")
+                             (list "    (bar y)" "    (baz y)" "    y))"
+                                   "" "(provide 'example)")))
+               (list :file "/tmp/other-file.py"
+                     :start-line 40 :end-line 43
+                     :start-col 4 :end-col 12
+                     :instruction "this needs a docstring"
+                     :lines (list "def helper(a, b):"
+                                  "    total = a + b"
+                                  "    return total"
+                                  ""))))
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (should (derived-mode-p 'org-mode))
+            (let ((text (buffer-string)))
+              (should (string-match-p
+                       "\\* claude-emacs-bridge\\.el (lines 100-114, cols 0-40)" text))
+              (should (string-match-p "Instruction: fix the off-by-one here" text))
+              (should (string-match-p "#\\+begin_src emacs-lisp" text))
+              (should (string-match-p "100: (defun claude-emacs-bridge--example (x)" text))
+              (should (string-match-p "\\.\\.\\. (5 lines omitted) \\.\\.\\." text))
+              (should (string-match-p "114: (provide 'example)" text))
+              (should (string-match-p
+                       "\\* other-file\\.py (lines 40-43, cols 4-12)" text))
+              (should (string-match-p "#\\+begin_src python" text))
+              (should (string-match-p "40: def helper(a, b):" text))
+              (should (string-match-p "43: \n" text)))))
+      (when buffer (kill-buffer buffer)))))
+
+(ert-deftest claude-emacs-bridge-show-queue-test/empty-queue-renders-without-error ()
+  "An empty queue renders a buffer saying so, rather than erroring."
+  (let ((claude-emacs-bridge--queue nil)
+        (buffer nil))
+    (unwind-protect
+        (progn
+          (setq buffer (claude-emacs-bridge-show-queue))
+          (with-current-buffer buffer
+            (should (derived-mode-p 'org-mode))
+            (should (string-match-p "empty" (buffer-string)))))
+      (when buffer (kill-buffer buffer)))))
+
+;; Combined message builders
+
+(defvar claude-emacs-bridge-tests--fixture-entries
+  (list (list :file "/abs/a.el" :start-line 12 :end-line 40
+             :start-col 4 :end-col 10
+             :instruction "fix the off-by-one here" :lines nil)
+        (list :file "/abs/b.el" :start-line 5 :end-line 5
+             :start-col 0 :end-col 20
+             :instruction "this needs a docstring" :lines nil))
+  "Two-entry fixture shared by the combined-builder tests.")
+
+(ert-deftest claude-emacs-bridge--combined-socket-content-test/matches-entry-shape ()
+  "N-entry socket content numbers each entry and reuses the single-entry fields."
+  (let ((content (claude-emacs-bridge--combined-socket-content
+                  claude-emacs-bridge-tests--fixture-entries)))
+    (should (equal content
+                   (concat "Entry 1\n"
+                           "File: /abs/a.el\n"
+                           "Lines: 12-40\n"
+                           "Columns: 4-10\n"
+                           "Instruction: fix the off-by-one here"
+                           "\n\n"
+                           "Entry 2\n"
+                           "File: /abs/b.el\n"
+                           "Lines: 5-5\n"
+                           "Columns: 0-20\n"
+                           "Instruction: this needs a docstring")))))
+
+(ert-deftest claude-emacs-bridge--combined-relay-prompt-test/wraps-the-body-once ()
+  "The relay prompt wraps the shared body in one SendMessage/marker pair."
+  (let* ((session '((name . "task-1")))
+         (prompt (claude-emacs-bridge--combined-relay-prompt
+                  session claude-emacs-bridge-tests--fixture-entries)))
+    (should (string-match-p "Use SendMessage once to send @task-1" prompt))
+    (should (= (cl-count-if
+                (lambda (s) (string-match-p (regexp-quote "BEGIN TARGET MESSAGE") s))
+                (list prompt))
+               1))
+    (should (string-match-p "BEGIN TARGET MESSAGE" prompt))
+    (should (string-match-p "END TARGET MESSAGE" prompt))
+    (should (string-match-p "Entry 1" prompt))
+    (should (string-match-p "Entry 2" prompt))))
+
+(ert-deftest claude-emacs-bridge--combined-relay-prompt-test/escapes-mentions-per-instruction ()
+  "An @path inside one entry's instruction is escaped for the relay."
+  (let* ((session '((name . "task-1")))
+         (entries (list (list :file "/abs/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "inline @/tmp/x.sh here" :lines nil)))
+         (prompt (claude-emacs-bridge--combined-relay-prompt session entries)))
+    (should (string-match-p "inline \\\\@/tmp/x\\.sh here" prompt))))
+
+(ert-deftest claude-emacs-bridge--combined-socket-content-test/leaves-mentions-unescaped ()
+  "The socket builder does not escape at-mentions, matching the single-entry rule."
+  (let ((entries (list (list :file "/abs/a.el" :start-line 1 :end-line 1
+                             :start-col 0 :end-col 0
+                             :instruction "inline @/tmp/x.sh here" :lines nil))))
+    (should (string-match-p "inline @/tmp/x\\.sh here"
+                            (claude-emacs-bridge--combined-socket-content entries)))))
+
+;; claude-emacs-bridge-send-queue
+
+(ert-deftest claude-emacs-bridge-send-queue-test/empty-queue-signals-user-error ()
+  "An empty queue cannot be flushed."
+  (let ((claude-emacs-bridge--queue nil))
+    (should-error (claude-emacs-bridge-send-queue) :type 'user-error)))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/sends-combined-and-clears-queue ()
+  "A non-empty queue resolves one target, sends combined content, and clears."
+  (let ((claude-emacs-bridge--mode 'socket)
+        (claude-emacs-bridge--queue
+         (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                     :start-col 0 :end-col 0
+                     :instruction "one" :lines '("x"))
+               (list :file "/tmp/b.el" :start-line 2 :end-line 2
+                     :start-col 0 :end-col 0
+                     :instruction "two" :lines '("y"))))
+        (resolve-count 0)
+        (combined-entries nil)
+        (combined-session nil))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+               (lambda ()
+                 (setq resolve-count (1+ resolve-count))
+                 '((name . "task-1") (pid . 1))))
+              ((symbol-function 'claude-emacs-bridge--send-combined-via-socket)
+               (lambda (session entries)
+                 (setq combined-session session
+                       combined-entries entries)))
+              ((symbol-function 'claude-emacs-bridge--send-combined-via-relay)
+               (lambda (&rest _) (ert-fail "Socket mode must not use the relay path"))))
+      (claude-emacs-bridge-send-queue))
+    (should (= resolve-count 1))
+    (should (equal (alist-get 'name combined-session) "task-1"))
+    (should (= (length combined-entries) 2))
+    (should-not claude-emacs-bridge--queue)))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/exception-from-dispatch-propagates-and-keeps-queue ()
+  "An exception from the dispatch call propagates and leaves `--queue' intact."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'socket)
+         (claude-emacs-bridge--queue entries))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+               (lambda () '((name . "task-1") (pid . 1))))
+              ((symbol-function 'claude-emacs-bridge--send-combined-via-socket)
+               (lambda (&rest _) (error "boom"))))
+      (should-error (claude-emacs-bridge-send-queue)))
+    (should (equal claude-emacs-bridge--queue entries))))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/declined-relay-coordinator-keeps-queue ()
+  "A declined relay coordinator leaves `--queue' intact; nothing was sent."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge--queue entries))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+               (lambda () '((name . "task-1") (pid . 1))))
+              ((symbol-function 'claude-emacs-bridge--coordinator-buffer)
+               (lambda () nil)))
+      (should-not (claude-emacs-bridge--send-combined-via-relay
+                   '((name . "task-1") (pid . 1)) entries))
+      (claude-emacs-bridge-send-queue))
+    (should (equal claude-emacs-bridge--queue entries))))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/socket-file-error-keeps-queue ()
+  "A socket `file-error' leaves `--queue' intact; nothing was sent."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'socket)
+         (claude-emacs-bridge--queue entries))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+               (lambda () '((name . "task-1") (messagingSocketPath . "/tmp/gone.sock"))))
+              ((symbol-function 'claude-emacs-bridge--write-frame)
+               (lambda (&rest _) (signal 'file-error '("no such file"))))
+              ((symbol-function 'claude-emacs-bridge--ensure-receipt-socket)
+               (lambda () "/tmp/receipt.sock"))
+              ((symbol-function 'claude-emacs-bridge--uds-address)
+               (lambda (_) "unix:/tmp/receipt.sock")))
+      (claude-emacs-bridge-send-queue))
+    (should (equal claude-emacs-bridge--queue entries))))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/successful-socket-write-clears-queue ()
+  "A successful socket write clears `--queue'."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'socket)
+         (claude-emacs-bridge--queue entries))
+    (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+               (lambda () '((name . "task-1") (messagingSocketPath . "/tmp/live.sock"))))
+              ((symbol-function 'claude-emacs-bridge--write-frame)
+               (lambda (&rest _) nil))
+              ((symbol-function 'claude-emacs-bridge--ensure-receipt-socket)
+               (lambda () "/tmp/receipt.sock"))
+              ((symbol-function 'claude-emacs-bridge--uds-address)
+               (lambda (_) "unix:/tmp/receipt.sock")))
+      (claude-emacs-bridge-send-queue))
+    (should-not claude-emacs-bridge--queue)))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/successful-relay-dispatch-clears-queue ()
+  "A successful relay dispatch, confirmed submission, clears `--queue'."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge--queue entries))
+    (with-temp-buffer
+      (let ((coordinator (current-buffer)))
+        (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                   (lambda () '((name . "task-1") (pid . 1))))
+                  ((symbol-function 'claude-emacs-bridge--coordinator-buffer)
+                   (lambda () coordinator))
+                  ((symbol-function 'vterm-send-string) (lambda (&rest _) nil))
+                  ((symbol-function 'vterm-send-return) (lambda () nil))
+                  ((symbol-function 'claude-emacs-bridge--await-submit)
+                   (lambda (&rest _) t)))
+          (claude-emacs-bridge-send-queue))))
+    (should-not claude-emacs-bridge--queue)))
+
+(ert-deftest claude-emacs-bridge-send-queue-test/unconfirmed-relay-submission-still-clears-queue ()
+  "An unconfirmed relay submission still clears `--queue': the text left Emacs."
+  (let* ((entries (list (list :file "/tmp/a.el" :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "one" :lines '("x"))))
+         (claude-emacs-bridge--mode 'relay)
+         (claude-emacs-bridge--queue entries))
+    (with-temp-buffer
+      (let ((coordinator (current-buffer)))
+        (cl-letf (((symbol-function 'claude-emacs-bridge--resolve-target)
+                   (lambda () '((name . "task-1") (pid . 1))))
+                  ((symbol-function 'claude-emacs-bridge--coordinator-buffer)
+                   (lambda () coordinator))
+                  ((symbol-function 'vterm-send-string) (lambda (&rest _) nil))
+                  ((symbol-function 'vterm-send-return) (lambda () nil))
+                  ((symbol-function 'claude-emacs-bridge--await-submit)
+                   (lambda (&rest _) nil)))
+          (claude-emacs-bridge-send-queue))))
+    (should-not claude-emacs-bridge--queue)))
 
 (provide 'claude-emacs-bridge-tests)
 ;;; claude-emacs-bridge-tests.el ends here
