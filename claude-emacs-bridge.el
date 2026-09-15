@@ -1076,6 +1076,37 @@ narrowed buffer does not shift what is captured."
         (end-of-line)
         (split-string (buffer-substring-no-properties beg (point)) "\n")))))
 
+(defun claude-emacs-bridge--read-file-range (file start-line end-line)
+  "Return FILE's text from START-LINE through END-LINE, read fresh from disk.
+Returns the same shape `claude-emacs-bridge--capture-lines' returns for the
+current buffer, but FILE is always read from disk, never from any buffer
+already visiting it.  Returns nil when FILE cannot be read (deleted, moved,
+permission denied) rather than signalling; a caller distinguishes
+\"unreadable\" from \"legitimately empty\" by checking `file-readable-p'
+first, not by nil alone, since a legitimately empty range is also nil."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (claude-emacs-bridge--capture-lines start-line end-line))))
+
+(defun claude-emacs-bridge--entry-staleness (entry)
+  "Return how ENTRY's captured `:lines' compares to FILE's content now.
+Returns nil when ENTRY's file was read and its content at :start-line
+through :end-line matches :lines exactly, `stale' when the read succeeded
+but the content differs, or `missing' when the file cannot be read at all.
+Pure aside from the one file read `claude-emacs-bridge--read-file-range'
+performs."
+  (let ((file (plist-get entry :file)))
+    (if (not (file-readable-p file))
+        'missing
+      (let ((current (claude-emacs-bridge--read-file-range
+                       file
+                       (plist-get entry :start-line)
+                       (plist-get entry :end-line))))
+        (if (equal current (plist-get entry :lines))
+            nil
+          'stale)))))
+
 (defun claude-emacs-bridge--enqueue-send (range col-range file instruction)
   "Push a queue entry for FILE covered by RANGE and COL-RANGE, with INSTRUCTION.
 RANGE and COL-RANGE are inclusive line and 0-indexed column conses, as
@@ -1111,6 +1142,12 @@ untruncated captured lines, read back with `(read (org-entry-get pos
 block.  The heading text and the src block's line numbers are for reading
 only, and are never parsed back.
 
+The heading also carries a staleness marker, \" [STALE]\" or \" [FILE NOT
+FOUND]\", from `claude-emacs-bridge--entry-staleness', when ENTRY's file on
+disk no longer matches what was captured.  The marker is decorative text in
+the heading, not data: `claude-emacs-bridge-queue-buffer-commit' never parses
+it back.
+
 Everything in the result except the instruction's typed text carries the
 `read-only' text property (with the sticky properties needed at its edges),
 so a caller that inserts this string verbatim gets an editable instruction
@@ -1123,9 +1160,14 @@ and a protected heading, drawer, and src block for free."
          (instruction (plist-get entry :instruction))
          (lines (plist-get entry :lines))
          (rows (claude-emacs-bridge--truncate-lines lines start-line))
-         (heading (format "* %s (lines %d-%d, cols %d-%d)\n"
+         (staleness (claude-emacs-bridge--entry-staleness entry))
+         (heading (format "* %s (lines %d-%d, cols %d-%d)%s\n"
                            (file-name-nondirectory file)
-                           start-line end-line start-col end-col))
+                           start-line end-line start-col end-col
+                           (pcase staleness
+                             ('stale " [STALE]")
+                             ('missing " [FILE NOT FOUND]")
+                             (_ ""))))
          (drawer (concat
                   ":PROPERTIES:\n"
                   (format ":SOURCE-FILE: %s\n" file)

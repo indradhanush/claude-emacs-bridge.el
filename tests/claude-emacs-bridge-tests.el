@@ -2299,6 +2299,100 @@ Same reason the relay path drops background agents."
     (narrow-to-region (point) (point-max))
     (should (equal (claude-emacs-bridge--capture-lines 3 4) '("three" "four")))))
 
+;; claude-emacs-bridge--read-file-range
+
+(ert-deftest claude-emacs-bridge--read-file-range-test/reads-lines-fresh-from-disk ()
+  "The range is read from FILE on disk, in the same shape as `--capture-lines'."
+  (let ((file (make-temp-file "bridge-range-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "one\ntwo\nthree\nfour\n"))
+          (should (equal (claude-emacs-bridge--read-file-range file 2 3)
+                         '("two" "three"))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--read-file-range-test/single-line-range ()
+  "A single-line range (start equals end) reads just that line."
+  (let ((file (make-temp-file "bridge-range-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "one\ntwo\nthree\n"))
+          (should (equal (claude-emacs-bridge--read-file-range file 2 2)
+                         '("two"))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--read-file-range-test/nonexistent-file-returns-nil ()
+  "A file that cannot be read returns nil rather than signalling."
+  (let ((file (make-temp-file "bridge-range-test")))
+    (delete-file file)
+    (should-not (claude-emacs-bridge--read-file-range file 1 1))))
+
+(ert-deftest claude-emacs-bridge--read-file-range-test/never-reads-an-open-buffer ()
+  "The read comes from disk, ignoring any open buffer visiting the same file."
+  (let ((file (make-temp-file "bridge-range-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "on disk\n"))
+          (let ((visiting (find-file-noselect file)))
+            (unwind-protect
+                (progn
+                  (with-current-buffer visiting
+                    (goto-char (point-max))
+                    (insert "unsaved edit\n"))
+                  (should (equal (claude-emacs-bridge--read-file-range file 1 1)
+                                 '("on disk"))))
+              (with-current-buffer visiting (set-buffer-modified-p nil))
+              (kill-buffer visiting))))
+      (delete-file file))))
+
+;; claude-emacs-bridge--entry-staleness
+
+(ert-deftest claude-emacs-bridge--entry-staleness-test/matching-content-returns-nil ()
+  "An entry whose captured lines still match the file on disk is not stale."
+  (let ((file (make-temp-file "bridge-staleness-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "one\ntwo\nthree\n"))
+          (let ((entry (list :file file :start-line 1 :end-line 2
+                              :lines '("one" "two"))))
+            (should-not (claude-emacs-bridge--entry-staleness entry))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--entry-staleness-test/differing-content-returns-stale ()
+  "An entry whose captured lines no longer match the file on disk is stale."
+  (let ((file (make-temp-file "bridge-staleness-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "one\nCHANGED\nthree\n"))
+          (let ((entry (list :file file :start-line 1 :end-line 2
+                              :lines '("one" "two"))))
+            (should (eq (claude-emacs-bridge--entry-staleness entry) 'stale))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--entry-staleness-test/nonexistent-file-returns-missing ()
+  "An entry whose file no longer exists is reported missing."
+  (let ((file (make-temp-file "bridge-staleness-test")))
+    (delete-file file)
+    (let ((entry (list :file file :start-line 1 :end-line 1 :lines '("one"))))
+      (should (eq (claude-emacs-bridge--entry-staleness entry) 'missing)))))
+
+(ert-deftest claude-emacs-bridge--entry-staleness-test/empty-range-compares-correctly ()
+  "A single-line captured range compares its one line, not vacuously stale."
+  (let ((file (make-temp-file "bridge-staleness-test")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "only line\n"))
+          (let ((entry (list :file file :start-line 1 :end-line 1
+                              :lines '("only line"))))
+            (should-not (claude-emacs-bridge--entry-staleness entry))))
+      (delete-file file))))
+
 (ert-deftest claude-emacs-bridge-send-test/queue-mode-appends-entry-and-skips-transport ()
   "Queue mode on captures the entry instead of dispatching to a transport."
   (let ((claude-emacs-bridge--mode 'relay)
@@ -2546,6 +2640,98 @@ instruction, which is exactly where a user naturally extends it (e.g. after
       (let ((inhibit-read-only nil))
         (should-error (backward-delete-char 1) :type 'text-read-only)))))
 
+;; claude-emacs-bridge--format-queue-entry: staleness marker
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/fresh-entry-heading-has-no-marker ()
+  "An entry whose captured lines still match disk renders with no marker.
+Regression check: the heading for a fresh entry must render byte-for-byte
+identical to before the staleness indicator existed."
+  (let ((file (make-temp-file "bridge-fresh-test" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "a\nb\n"))
+          (let* ((entry (list :file file :start-line 1 :end-line 2
+                               :start-col 0 :end-col 0
+                               :instruction "do it" :lines '("a" "b")))
+                 (text (claude-emacs-bridge--format-queue-entry entry)))
+            (should (equal
+                     (car (split-string text "\n"))
+                     (format "* %s (lines 1-2, cols 0-0)"
+                             (file-name-nondirectory file))))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/fresh-entry-heading-carries-no-marker ()
+  "An entry whose disk content still matches renders with no staleness marker.
+Every other fixture in this suite uses a nonexistent /tmp path, which never
+actually exercises the nil (matching) branch of `claude-emacs-bridge--entry-staleness'
+with a real file - this is the one that does, and it's the strict regression
+constraint: a fresh entry's heading must be byte-for-byte identical to what
+`claude-emacs-bridge--format-queue-entry' produced before staleness marking
+existed."
+  (let ((file (make-temp-file "bridge-fresh-test" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "a\nb\n"))
+          (let* ((entry (list :file file :start-line 1 :end-line 2
+                               :start-col 0 :end-col 0
+                               :instruction "do it" :lines '("a" "b")))
+                 (text (claude-emacs-bridge--format-queue-entry entry))
+                 (expected-heading
+                  (format "* %s (lines 1-2, cols 0-0)\n" (file-name-nondirectory file))))
+            (should (string-prefix-p expected-heading text))
+            (should-not (string-match-p "\\[STALE\\]\\|\\[FILE NOT FOUND\\]" text))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/stale-entry-heading-carries-marker ()
+  "An entry whose disk content changed renders with a [STALE] marker."
+  (let ((file (make-temp-file "bridge-stale-test" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "CHANGED\nb\n"))
+          (let* ((entry (list :file file :start-line 1 :end-line 2
+                               :start-col 0 :end-col 0
+                               :instruction "do it" :lines '("a" "b")))
+                 (text (claude-emacs-bridge--format-queue-entry entry)))
+            (should (string-match-p
+                     (regexp-quote
+                      (format "* %s (lines 1-2, cols 0-0) [STALE]"
+                              (file-name-nondirectory file)))
+                     text))))
+      (delete-file file))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/missing-file-heading-carries-marker ()
+  "An entry whose file no longer exists renders with a [FILE NOT FOUND] marker."
+  (let ((file (make-temp-file "bridge-missing-test" nil ".el")))
+    (delete-file file)
+    (let* ((entry (list :file file :start-line 1 :end-line 1
+                         :start-col 0 :end-col 0
+                         :instruction "do it" :lines '("a")))
+           (text (claude-emacs-bridge--format-queue-entry entry)))
+      (should (string-match-p
+               (regexp-quote
+                (format "* %s (lines 1-1, cols 0-0) [FILE NOT FOUND]"
+                        (file-name-nondirectory file)))
+               text)))))
+
+(ert-deftest claude-emacs-bridge--format-queue-entry-test/stale-marker-is-read-only ()
+  "The [STALE] marker text carries the `read-only' property like the heading."
+  (let ((file (make-temp-file "bridge-stale-readonly-test" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "CHANGED\n"))
+          (let* ((entry (list :file file :start-line 1 :end-line 1
+                               :start-col 0 :end-col 0
+                               :instruction "do it" :lines '("a")))
+                 (text (claude-emacs-bridge--format-queue-entry entry))
+                 (marker-pos (string-match (regexp-quote "[STALE]") text)))
+            (should marker-pos)
+            (should (get-text-property marker-pos 'read-only text))))
+      (delete-file file))))
+
 ;; claude-emacs-bridge-queue-buffer-commit
 
 (ert-deftest claude-emacs-bridge--required-property-test/missing-property-signals-user-error ()
@@ -2698,6 +2884,33 @@ instruction, which is exactly where a user naturally extends it (e.g. after
             (should (eq (key-binding (kbd "C-c C-c"))
                         #'claude-emacs-bridge-queue-buffer-commit))))
       (when buffer (kill-buffer buffer)))))
+
+(ert-deftest claude-emacs-bridge-queue-buffer-commit-test/stale-marked-entry-round-trips ()
+  "Committing a stale-marked entry still round-trips its :file/:lines correctly.
+The [STALE] marker is decorative text in the heading; the commit path never
+parses heading text for data, only the properties drawer and Instruction line."
+  (let ((file (make-temp-file "bridge-stale-commit-test" nil ".el")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "CHANGED\n"))
+          (let ((claude-emacs-bridge--queue
+                 (list (list :file file :start-line 1 :end-line 1
+                              :start-col 0 :end-col 0
+                              :instruction "do it" :lines '("a"))))
+                (buffer nil))
+            (unwind-protect
+                (progn
+                  (setq buffer (claude-emacs-bridge-show-queue))
+                  (with-current-buffer buffer
+                    (should (string-match-p "\\[STALE\\]" (buffer-string)))
+                    (claude-emacs-bridge-queue-buffer-commit))
+                  (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :file)
+                                 file))
+                  (should (equal (plist-get (nth 0 claude-emacs-bridge--queue) :lines)
+                                 '("a"))))
+              (when buffer (kill-buffer buffer)))))
+      (delete-file file))))
 
 ;; Combined message builders
 
