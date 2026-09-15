@@ -208,3 +208,7 @@ isolated batch Emacs rather than assumed from the manual: dropped
 [[*What Is Protected][What Is Protected]]). As first specified it also
 blocked ordinary typing at the end of the instruction, which would have
 undermined the whole point of making the instruction editable.
+
+Follow-on:
+[[file:./08-queue-staleness-indicator.org][Queue Staleness Indicator]]
+marks an entry whose frozen snippet no longer matches the file on disk.

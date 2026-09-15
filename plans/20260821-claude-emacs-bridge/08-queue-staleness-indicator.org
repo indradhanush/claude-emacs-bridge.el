@@ -1,0 +1,114 @@
+:PROPERTIES:
+:STATUS: DRAFT
+:STATUS_UPDATED_ON: 2026-09-15
+:END:
+#+title: Queue Staleness Indicator
+#+date: 2026-09-15
+
+* Objective
+
+[[file:./07-editable-queue-buffer.org][Editable Queue Buffer]] freezes each
+entry's captured snippet in a =:LINES:= property, read back verbatim on
+every commit rather than re-derived from disk. That is deliberate: what
+you review is what you originally selected, not whatever the file has
+become since. The gap is that nothing tells you when the two have
+diverged.
+
+Add a cheap, on-demand check: when =show-queue= renders, mark any entry
+whose captured =:lines= no longer matches what is currently on disk at
+that line range.
+
+* Why Not Read Live Instead
+
+Considered and rejected as a throwaway spike (not committed): reading
+the entry's line range fresh from disk on every render, dropping
+=:LINES:= entirely. Measured against the frozen-snapshot design plus this
+staleness check, on 50 entries with large regions (60-300 lines,
+9000 lines total):
+
+| Approach                                    | Per run (50 entries) | Per entry |
+|----------------------------------------------+-----------------------+-----------|
+| Frozen snapshot alone (current)             |               22.2 ms |   0.44 ms |
+| Staleness check alone (extra read + compare) |               37.3 ms |   0.75 ms |
+| Frozen snapshot + staleness check (this plan) |               59.4 ms |   1.19 ms |
+| Always read live, no =:LINES:=                |               40.9 ms |   0.82 ms |
+
+Frozen-snapshot-plus-staleness-check is slower than always-read-live,
+because the staleness check already pays for the same disk read
+always-read-live would, on top of the snapshot's own render cost. Kept
+anyway: all four numbers are well under the threshold of being
+noticeable against the time it takes to open the buffer, so this was
+never a performance decision. The frozen snapshot's value is the
+review-honesty argument in [[file:./07-editable-queue-buffer.org][Editable
+Queue Buffer]], and the staleness marker closes the one real gap that
+argument left open.
+
+* Mechanism
+
+- =claude-emacs-bridge--read-file-range (file start-line end-line)= ::
+  reads FILE fresh from disk (not from any open buffer) and returns the
+  same shape =--capture-lines= does for the current buffer. Returns nil
+  when the file cannot be read (deleted, moved, permission denied) rather
+  than signalling — a caller distinguishes "unreadable" from "empty" by
+  checking =file-readable-p= first, not by nil alone, since a legitimately
+  empty range is also representable.
+- =claude-emacs-bridge--entry-staleness (entry)= :: returns one of three
+  symbols: nil (the file was read and its content at that range matches
+  =:lines= exactly), ='stale= (read succeeded, content differs), or
+  ='missing= (the file could not be read at all). Pure aside from the one
+  file read.
+- =--format-queue-entry= gains this check per entry it renders, and
+  appends a marker to the heading when non-nil: =" [STALE]"= or
+  =" [FILE NOT FOUND]"=. The marker is plain text inside the heading's
+  already-=read-only= span - no new protection rules, no effect on
+  =claude-emacs-bridge-queue-buffer-commit=, which never parses heading
+  text for data.
+- Runs once per entry, only when =show-queue= is called - not on every
+  keystroke, not during =claude-emacs-bridge-queue-buffer-commit=. A
+  buffer left open while the file changes underneath it does not
+  self-update; re-running =show-queue= does.
+
+* Tasks
+
+** TODO Add the read-fresh and staleness helpers
+Add =--read-file-range= and =--entry-staleness=, both pure aside from the
+one file read.
+
+Test: matching content returns nil; differing content returns ='stale=;
+a nonexistent file returns ='missing=; an empty captured range (start
+equals end, single line) compares correctly, not vacuously stale.
+
+** TODO Mark stale/missing entries in the rendered heading
+Wire =--entry-staleness= into =--format-queue-entry=. Unchanged entries
+render exactly as before (no behavior change for the common case).
+
+Test: a fresh entry's heading is unchanged from today's rendering; a
+stale entry's heading carries =" [STALE]"=; a missing-file entry's
+heading carries =" [FILE NOT FOUND]"=; the marker text is still
+=read-only= like the rest of the heading; =claude-emacs-bridge-queue-buffer-commit=
+on a stale-marked entry still round-trips its =:file=/=:lines= correctly
+(the marker is decorative, not data).
+
+* Testing
+
+Per =CLAUDE.md=, every new helper gets a direct ERT test. File-reading
+tests use real temp files (=make-temp-file=, cleaned up in an
+=unwind-protect=) rather than faking =insert-file-contents=, since the
+behavior under test is specifically about reading real file state.
+
+* Decisions
+
+- 2026-09-15 :: Keep the frozen =:LINES:= snapshot; add a staleness
+  indicator on top rather than switching to always-read-live, despite
+  the spike showing the indicator costs more than always-read-live
+  would. Decided on review-honesty grounds, not performance - see
+  [[*Why Not Read Live Instead][Why Not Read Live Instead]].
+- 2026-09-15 :: The check runs on =show-queue= render only, not
+  continuously and not on commit.
+- 2026-09-15 :: "Missing" (file unreadable) and "stale" (content
+  differs) are reported as distinct states, not collapsed into one.
+
+* Next Steps
+
+- [ ] Add the two helpers, TDD, then wire the marker into
+  =--format-queue-entry=.
