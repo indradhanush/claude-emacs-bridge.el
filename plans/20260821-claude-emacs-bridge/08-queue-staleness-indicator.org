@@ -1,5 +1,5 @@
 :PROPERTIES:
-:STATUS: DRAFT
+:STATUS: DONE
 :STATUS_UPDATED_ON: 2026-09-15
 :END:
 #+title: Queue Staleness Indicator
@@ -70,7 +70,7 @@ argument left open.
 
 * Tasks
 
-** TODO Add the read-fresh and staleness helpers
+** DONE Add the read-fresh and staleness helpers
 Add =--read-file-range= and =--entry-staleness=, both pure aside from the
 one file read.
 
@@ -78,7 +78,7 @@ Test: matching content returns nil; differing content returns ='stale=;
 a nonexistent file returns ='missing=; an empty captured range (start
 equals end, single line) compares correctly, not vacuously stale.
 
-** TODO Mark stale/missing entries in the rendered heading
+** DONE Mark stale/missing entries in the rendered heading
 Wire =--entry-staleness= into =--format-queue-entry=. Unchanged entries
 render exactly as before (no behavior change for the common case).
 
@@ -110,5 +110,15 @@ behavior under test is specifically about reading real file state.
 
 * Next Steps
 
-- [ ] Add the two helpers, TDD, then wire the marker into
-  =--format-queue-entry=.
+Both tasks implemented and tested. Full suite: 198 tests, 197 as
+expected, 1 pre-existing skip, 0 unexpected.
+
+- [X] The two helpers, wired into =--format-queue-entry=.
+
+One gap closed during review: every fixture already in the suite uses a
+nonexistent =/tmp/...= path, so none of them actually exercised the nil
+(matching) branch of =--entry-staleness= against a real file - they all
+silently rendered with =[FILE NOT FOUND]= and still passed, because their
+assertions only substring-match the heading. Added a dedicated test with
+a real temp file proving a fresh entry's heading is still byte-for-byte
+identical to pre-marker output.
