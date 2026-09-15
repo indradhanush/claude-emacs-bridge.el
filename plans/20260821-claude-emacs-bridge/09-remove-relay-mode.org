@@ -1,0 +1,182 @@
+:PROPERTIES:
+:STATUS: DRAFT
+:STATUS_UPDATED_ON: 2026-09-15
+:END:
+#+title: Remove Relay Mode
+#+date: 2026-09-15
+
+* Objective
+
+Dhanush has used socket mode exclusively since
+[[file:./05-socket-send-path.org][Socket Send Path]] landed. Drop relay mode
+(the coordinator vterm, its prompt-typing/paste-race machinery, and the
+mode-choice/switch layer built to let both coexist) and make socket the
+only delivery path. Nothing that sends, queues, shows, or commits a
+queue entry changes behavior; those already run through socket mode
+today whenever =claude-emacs-bridge--mode= is ='socket=.
+
+Checked before writing this plan: no keybinding in
+=~/.config/doom/= references any command this removes.
+
+* What Gets Deleted
+
+** Public commands (no socket equivalent - relay-only)
+
+- =claude-emacs-bridge-start=
+- =claude-emacs-bridge-clear=
+- =claude-emacs-bridge-switch-transport=
+
+** Internal functions
+
+- Coordinator/vterm: =--coordinator-buffer=, =--coordinator-pid=,
+  =--pending-paste-p=, =--wait-for-paste-clear=, =--await-submit=
+- Relay prompt building: =--format-prompt=, =--combined-relay-prompt=,
+  =--escape-mentions= (used only by the two prompt builders above)
+- Relay session discovery: =--discover-sessions-cli=
+- Mode selection: =--ensure-mode=, =--require-mode=, =--read-transport=
+- Mode teardown (only ever called from =switch-transport=): =--holdings=,
+  =--check-releasable=, =--release=
+- Relay sending: =--send-via-relay=, =--send-combined-via-relay=
+
+** Variables and options
+
+- =claude-emacs-bridge-buffer-name=, =claude-emacs-bridge-program=
+- =claude-emacs-bridge-preferred-transport=, =claude-emacs-bridge--mode=,
+  =claude-emacs-bridge--transports=
+- =claude-emacs-bridge-paste-placeholder-regexp=,
+  =claude-emacs-bridge-submit-resend-interval=,
+  =claude-emacs-bridge-submit-poll-interval=,
+  =claude-emacs-bridge-submit-max-resends=, =claude-emacs-bridge--paste-tail-window=
+- =claude-emacs-bridge--startup-command=, =claude-emacs-bridge--coordinator-p=
+- The =vterm= =declare-function= forms. The =persp-mode= ones stay -
+  =--context-key= uses them and has nothing to do with relay.
+
+* What Gets Simplified
+
+Each of these keeps its name and its socket-mode behavior exactly;
+only the now-pointless relay branch and mode dispatch come out.
+
+- =claude-emacs-bridge-send= :: drop the =(mode (claude-emacs-bridge--ensure-mode))=
+  binding and the =pcase= over it. Queue mode still branches to
+  =--enqueue-send=; a non-queued send calls =--send-via-socket= directly.
+- =claude-emacs-bridge-send-queue= :: same shape - drop the mode
+  binding and =pcase=, call =--send-combined-via-socket= directly.
+- =claude-emacs-bridge-list-sessions=, =claude-emacs-bridge-select-session= ::
+  drop the =(claude-emacs-bridge--ensure-mode)= call; call
+  =claude-emacs-bridge--registry-sessions= directly instead of going
+  through =--discover-sessions=.
+- =claude-emacs-bridge--discover-sessions= :: deleted outright once its
+  only two callers above call =--registry-sessions= directly - a
+  one-branch dispatcher with no remaining reason to exist as its own
+  function.
+
+Untouched: =--registry-sessions=, =--registry-row=,
+=claude-emacs-bridge-registry-directory=, =--resolve-target=,
+=--read-session=, =--session-label=, everything from
+[[file:./04-inbox-socket-delivery.org][Inbox Socket Delivery]] onward
+that already belongs to socket mode, and everything from queue mode
+(plans 06-08) except the two =pcase= sites named above.
+
+* Test Suite Impact
+
+~46 tests deleted outright - they exist only to exercise what this
+plan removes (coordinator/vterm, paste-submit race, relay prompt
+building, mode selection, =switch-transport=, and the relay branches of
+=send=/=send-queue=). A handful of others lose their now-dead relay
+=cl-letf= fakes and =pcase= assertions but keep their socket-mode
+assertions unchanged.
+
+No test is rewritten to assert new behavior - this plan removes
+behavior, it does not add any. The regression bar is: every socket-mode
+test that passes today still passes unchanged.
+
+* Documentation Impact
+
+This repo's =CLAUDE.md= documents relay internals at length across three
+of its five architecture sections ("The coordinator is a vterm running
+Claude Code", "The coordinator must not read files", "Submitting a
+paste is a race") plus relay-specific parts of "Session discovery and
+routing". These get rewritten, not trimmed - what remains has to read
+as a description of a socket-only package, not a socket-only package
+with relay's ghost still described in present tense. The =Commands=
+section's two batch-run invocations stay as-is (they already work
+against whatever the file currently defines).
+
+* Tasks
+
+** TODO Remove relay from the two shared send paths
+=claude-emacs-bridge-send= and =claude-emacs-bridge-send-queue= drop their
+mode binding and =pcase=, calling the socket function directly. Delete
+=--send-via-relay= and =--send-combined-via-relay=.
+
+Test: delete their =relay-mode-uses-the-relay-path=-shaped tests and the
+three =send-queue= relay tests (=declined-relay-coordinator-keeps-queue=,
+=successful-relay-dispatch-clears-queue=,
+=unconfirmed-relay-submission-still-clears-queue=); the socket-path
+tests for both commands keep passing unchanged.
+
+** TODO Remove mode selection and relay discovery
+Delete =--ensure-mode=, =--require-mode=, =--read-transport=,
+=--discover-sessions-cli=, =--discover-sessions=, =claude-emacs-bridge-program=,
+=claude-emacs-bridge-preferred-transport=, =claude-emacs-bridge--mode=,
+=claude-emacs-bridge--transports=. Update =list-sessions= and
+=select-session= to call =--registry-sessions= directly with no mode call.
+
+Test: delete the =--ensure-mode-test/*=, =--read-transport-test/*=, and
+CLI-discovery tests; =list-sessions=/=select-session= tests keep passing
+with =--registry-sessions= faked directly instead of =--discover-sessions=.
+
+** TODO Remove the coordinator, the paste race, and relay prompt building
+Delete =claude-emacs-bridge-start=, =claude-emacs-bridge-clear=,
+=--coordinator-buffer=, =--coordinator-pid=, =--pending-paste-p=,
+=--wait-for-paste-clear=, =--await-submit=, =--format-prompt=,
+=--combined-relay-prompt=, =--escape-mentions=, =--startup-command=, the
+=vterm= =declare-function= forms, =claude-emacs-bridge-buffer-name=,
+=claude-emacs-bridge--coordinator-p=, and the four paste/submit
+=defcustom=s plus =--paste-tail-window=.
+
+Test: delete every test listed in =Test Suite Impact= that targets these.
+
+** TODO Remove the mode-switch and teardown layer
+Delete =claude-emacs-bridge-switch-transport=, =--holdings=,
+=--check-releasable=, =--release=.
+
+Test: delete every =switch-transport-test/*=.
+
+** TODO Rewrite CLAUDE.md for a socket-only package
+Remove the three relay-only architecture sections and the relay parts
+of session discovery. Keep and, where it references something just
+deleted, correct: "The receipt socket", "Confirming Delivery",
+"Reporting The Outcome", "Line ranges", "Conventions".
+
+* Testing
+
+Run the full suite after every task:
+#+begin_example
+emacs -Q --batch -L . -L tests -l ert -l tests/claude-emacs-bridge-tests.el -f ert-run-tests-batch-and-exit
+#+end_example
+
+Per =CLAUDE.md=, a deleted function's tests are deleted with it, not left
+behind disabled or commented out.
+
+* Decisions
+
+- 2026-09-15 :: Relay mode is removed outright, not deprecated or kept
+  behind a flag. Confirmed no keybinding in =~/.config/doom/= references
+  any command this removes, and Dhanush has used socket mode
+  exclusively since it landed.
+- 2026-09-15 :: =--discover-sessions= is deleted rather than collapsed to
+  a one-line wrapper around =--registry-sessions= - a single-branch
+  dispatcher earns its keep less than its two callers just calling the
+  real function.
+- 2026-09-15 :: This plan removes behavior only. No test is rewritten to
+  assert something new; the regression bar is every socket-mode test
+  passing unchanged.
+
+* Next Steps
+
+- [ ] Remove relay from =send=/=send-queue=, then mode selection and
+  discovery, then the coordinator/paste-race/prompt layer, then
+  =switch-transport=, in that order - each slice leaves the suite green.
+- [ ] Rewrite =CLAUDE.md= last, once the code it describes has actually
+  changed shape.
